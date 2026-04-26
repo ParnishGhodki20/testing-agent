@@ -1,0 +1,11 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
+  "include": ["app", "main.py"],
+  "exclude": ["__pycache__", ".venv", "chroma_db"],
+  "reportMissingModuleSource": "none",
+  "reportUnknownVariableType": "none",
+  "reportUnknownMemberType": "none",
+  "typeCheckingMode": "basic"
+}

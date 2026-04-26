@@ -1,0 +1,6 @@
+{
+  "include": ["app/**/*.py", "main.py"],
+  "exclude": ["__pycache__", ".venv", "chroma_db"],
+  "pythonInterpreter": ".venv/bin/python",
+  "typeCheckingMode": "off"
+}
