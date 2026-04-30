@@ -1,10 +1,13 @@
 """
 Icertis Testing Copilot — Chainlit entry point.
 
-Flow:
+Architecture (v2 — eval-based):
   on_chat_start  → upload → extract → index → ready
-  on_message     → classify_intent → mode chain → verifier + coverage check
-                 → auto gap-fill if coverage incomplete
+  on_message     → classify_intent → mode chain
+                 → eval layer (Python, deterministic)
+                 → one retry if eval fails on completeness
+                 → sanitizer / formatter
+                 → final output
                  → [optional] ADO push flow for test cases
 """
 import asyncio
@@ -23,12 +26,10 @@ from app.config import (
     ADO_FEATURE_ID, ADO_ITERATION_PATH, ADO_PAT,
     ADO_PROJECT, ADO_TAG,
     TC_BATCH_SIZE,
+    FAST_MODE,
 )
-from app.coverage import (
-    check_scenario_coverage,
-    check_tc_coverage,
-    extract_scenario_ids,
-)
+from app.coverage import check_tc_coverage
+from app.evals import eval_scenarios, eval_tc_output, build_coverage_map, format_coverage_map
 from app.extractors import extract_text
 from app.rag import (
     build_chain, build_index, build_llm, build_tc_llm,
@@ -42,7 +43,6 @@ from app.scenarios import (
     parse_test_cases,
     renumber_scenarios,
 )
-from app.verifier import build_verifier_llm, verify_scenarios, verify_test_cases
 
 logger = logging.getLogger(__name__)
 _AUTHOR = "icertis-testing-copilot"
@@ -156,10 +156,9 @@ async def on_chat_start():
         search_kwargs={"k": config.RETRIEVER_K, "fetch_k": config.RETRIEVER_FETCH_K},
     )
 
-    # ── Build LLMs & chains ──────────────────────────────────────────────────
-    gen_llm    = build_llm(temperature=0.2, num_predict=4000)
-    tc_llm     = build_tc_llm()     # faster, tighter — used only for TC batch generation
-    verify_llm = build_verifier_llm()
+    # ── Build LLMs & chains (single model — no verifier) ────────────────────
+    gen_llm = build_llm(temperature=0.2, num_predict=4000)
+    tc_llm  = build_tc_llm()
 
     scenario_chain = build_chain("scenario", gen_llm, retriever)
     general_chain  = build_chain("general",  gen_llm, retriever)
@@ -168,21 +167,22 @@ async def on_chat_start():
     cl.user_session.set("scenario_chain",   scenario_chain)
     cl.user_session.set("general_chain",    general_chain)
     cl.user_session.set("gen_llm",          gen_llm)
-    cl.user_session.set("tc_llm",           tc_llm)       # dedicated TC LLM
-    cl.user_session.set("verify_llm",       verify_llm)
+    cl.user_session.set("tc_llm",           tc_llm)
     cl.user_session.set("retriever",        retriever)
     cl.user_session.set("chat_history",     [])
     cl.user_session.set("conversation_summary", "")
-    cl.user_session.set("last_scenarios",   "")   # clean SC list (text)
-    cl.user_session.set("last_scenarios_parsed", [])  # list[dict] from parse_scenario_titles
-    cl.user_session.set("last_tc_output",   "")   # merged TC text (for coverage_revise)
-    cl.user_session.set("last_context",     "")   # last retrieved context
+    cl.user_session.set("last_scenarios",   "")
+    cl.user_session.set("last_scenarios_parsed", [])
+    cl.user_session.set("last_tc_output",   "")
+    cl.user_session.set("last_context",     "")
 
     doc_count   = len(processed)
     chunk_count = len(all_chunks)
+    mode_label = "⚡ Fast" if FAST_MODE else "🔬 Standard"
     await cl.Message(
         content=(
-            f"✅ Ready! Indexed **{chunk_count} chunks** from **{doc_count} document(s)**.\n\n"
+            f"✅ Ready! Indexed **{chunk_count} chunks** from **{doc_count} document(s)**.\n"
+            f"Mode: {mode_label}\n\n"
             "**What you can do:**\n"
             "- 💬 Ask any question about the documents\n"
             "- 📋 Say *'Generate scenarios'* for high-level test scenarios\n"
@@ -211,7 +211,6 @@ async def on_message(message: cl.Message):
     general_chain         = cl.user_session.get("general_chain")
     gen_llm               = cl.user_session.get("gen_llm")
     tc_llm                = cl.user_session.get("tc_llm")
-    verify_llm            = cl.user_session.get("verify_llm")
     retriever             = cl.user_session.get("retriever")
     chat_history          = cl.user_session.get("chat_history", [])
     summary               = cl.user_session.get("conversation_summary", "")
@@ -219,11 +218,12 @@ async def on_message(message: cl.Message):
     last_scenarios_parsed = cl.user_session.get("last_scenarios_parsed", [])
     last_tc_output        = cl.user_session.get("last_tc_output", "")
     last_context          = cl.user_session.get("last_context", "")
+    pending_pass2         = cl.user_session.get("pending_pass2", [])
 
     user_input = message.content.strip()
 
     # ── Intent classification ────────────────────────────────────────────────
-    intent = classify_intent(user_input, has_scenarios=bool(last_scenarios))
+    intent = classify_intent(user_input, has_scenarios=bool(last_scenarios), has_pending_pass2=bool(pending_pass2))
     logger.info("Intent: '%s' | has_scenarios: %s", intent, bool(last_scenarios))
 
     # ════════════════════════════════════════════════════════════════════════
@@ -313,26 +313,25 @@ async def on_message(message: cl.Message):
         raw_answer  = response.get("answer", "")
         new_context = response.get("context", last_context)
 
-        # ── Deterministic renumbering (always, before any other processing) ────
+        # ── Deterministic renumbering ────────────────────────────────────────
         raw_answer = renumber_scenarios(raw_answer)
 
-        # ── Sanitize scenario output (strip verifier noise, blank lines) ────────
+        # ── Sanitize ────────────────────────────────────────────────────────
         raw_answer = sanitize_scenarios(raw_answer)
 
-        # ── Verifier: format + grounding + bucket coverage ───────────────────
-        async with cl.Step(name="🔍 Verifying scenario coverage…") as vstep:
-            final_answer, verdict_label, cov_report = await verify_scenarios(
-                generated=raw_answer,
-                context=new_context,
-                llm=verify_llm,
-            )
-            vstep.output = cov_report.summary()
+        # ── Eval (Python-only, <10ms) ────────────────────────────────────────
+        async with cl.Step(name="✅ Evaluating scenario quality…") as estep:
+            eval_result = eval_scenarios(raw_answer)
+            estep.output = eval_result.summary()
 
-        # ── If verifier flagged missing buckets → one auto-revise ────────────
-        if not cov_report.is_complete:
-            missing_desc = ", ".join(cov_report.missing_buckets)
+        final_answer = raw_answer
+
+        # ── If eval found missing coverage buckets → one auto-supplement ─────
+        if (eval_result.coverage_report
+                and not eval_result.coverage_report.is_complete
+                and not FAST_MODE):
+            missing_desc = ", ".join(eval_result.coverage_report.missing_buckets)
             async with cl.Step(name=f"🔄 Adding missing coverage: {missing_desc}…") as rstep:
-                # Ask the scenario chain to add only the missing areas
                 revise_inputs = {
                     "input": (
                         f"The following coverage areas are missing from the scenarios: {missing_desc}. "
@@ -350,8 +349,15 @@ async def on_message(message: cl.Message):
                     rev_response = await scenario_chain.ainvoke(revise_inputs)
                     supplement   = rev_response.get("answer", "").strip()
                     if supplement:
-                        final_answer = final_answer.rstrip() + "\n\n" + supplement
+                        supplement = renumber_scenarios(supplement)
+                        supplement = sanitize_scenarios(supplement)
+                        # If first pass was a refusal (no SCs), replace it entirely
+                        if not re.search(r"(?i)\bSC\s*\d+\s*[:\-\.]?", final_answer):
+                            final_answer = supplement
+                        else:
+                            final_answer = final_answer.rstrip() + "\n\n" + supplement
                     rstep.output = "✅ Additional scenarios added."
+
                 except Exception as exc:
                     logger.warning("Coverage supplement failed: %s", exc)
                     rstep.output = f"⚠️ Could not add missing coverage: {exc}"
@@ -360,7 +366,7 @@ async def on_message(message: cl.Message):
         parsed = parse_scenario_titles(final_answer)
         if parsed:
             clean = "\n".join(
-                f"{s['id']}: {s['title']}\nDescription: {s['description']}"
+                f"{s['id']}: {s['title']}\nPriority: {s['priority']}\nDescription: {s['description']}"
                 for s in parsed
             )
             cl.user_session.set("last_scenarios", clean)
@@ -377,15 +383,13 @@ async def on_message(message: cl.Message):
         cl.user_session.set("chat_history", chat_history)
         cl.user_session.set("conversation_summary", summary)
 
-        # Verifier status is shown in the Step UI (vstep.output) — not appended to user message
         await cl.Message(content=final_answer, author=_AUTHOR).send()
         return
 
     # ════════════════════════════════════════════════════════════════════════
-    # Branch: Test case generation (scenario-by-scenario loop)
+    # Branch: Test case generation (prioritised multi-pass + rolling batches)
     # ════════════════════════════════════════════════════════════════════════
     if intent == "testcase":
-        # Use parsed scenario list; fall back to parsing from text if needed
         scenarios_to_process = last_scenarios_parsed or parse_scenario_titles(last_scenarios)
 
         if not scenarios_to_process:
@@ -399,104 +403,132 @@ async def on_message(message: cl.Message):
             return
 
         sc_ids = [s["id"] for s in scenarios_to_process]
-        n_batches = (len(scenarios_to_process) + TC_BATCH_SIZE - 1) // TC_BATCH_SIZE
-        logger.info(
-            "TC generation: %d scenarios in %d batch(es) of %d",
-            len(scenarios_to_process), n_batches, TC_BATCH_SIZE,
-        )
 
-        # ── Rolling TC generation (per-batch verify + sanitize) ───────────────
+        # ── Split scenarios by priority into two passes ───────────────────────
+        pass1 = [s for s in scenarios_to_process if s.get("priority", "Medium") in ("Critical", "High")]
+        pass2 = [s for s in scenarios_to_process if s.get("priority", "Medium") in ("Medium", "Low")]
+        
+        # Save Medium/Low to session for conditional step
+        cl.user_session.set("pending_pass2", pass2)
+        
+        if pass1:
+            p1_ids = [s["id"] for s in pass1]
+            n1 = (len(pass1) + TC_BATCH_SIZE - 1) // TC_BATCH_SIZE
+            p1_priorities = sorted({s.get("priority", "Medium") for s in pass1})
+            
+            async with cl.Step(
+                name=(
+                    f"🔴 Pass 1 — {', '.join(p1_priorities)} priority: "
+                    f"{len(pass1)} scenario(s) in {n1} batch(es)…"
+                )
+            ) as gstep:
+                tc_text, ctx, completed = await generate_tcs_rolling(
+                    scenarios=pass1,
+                    llm=tc_llm,
+                    retriever=retriever,
+                    summary=summary,
+                )
+                missed = [s for s in p1_ids if s not in completed]
+                gstep.output = (
+                    f"✅ Covered: {', '.join(completed)}"
+                    + (f" | ⚠️ Missed: {', '.join(missed)}" if missed else "")
+                )
+            
+            if not tc_text.strip():
+                await cl.Message(
+                    content="⚠️ TC generation returned empty output. Please try again.",
+                    author=_AUTHOR,
+                ).send()
+                return
+
+            final_tc = sanitize_test_cases(tc_text)
+            
+            # Update memory
+            cl.user_session.set("last_tc_output", final_tc)
+            cl.user_session.set("last_context", ctx)
+            
+            # Post generation evaluation
+            final_eval = eval_tc_output(final_tc, p1_ids)
+            coverage_map = build_coverage_map(final_tc, p1_ids)
+            map_display  = format_coverage_map(coverage_map)
+            
+            async with cl.Step(name="📊 Scenario → Test Case Coverage Map") as mstep:
+                mstep.output = map_display
+                
+            chat_history, summary = _update_memory(user_input, final_tc, chat_history, summary)
+            cl.user_session.set("chat_history", chat_history)
+            cl.user_session.set("conversation_summary", summary)
+            
+            await cl.Message(content=final_tc, author=_AUTHOR).send()
+            
+            if pass2:
+                await cl.Message(
+                    content="**Test cases for Critical and High priority scenarios are ready.**\n\nDo you want me to generate test cases for Medium and Low priority scenarios as well?",
+                    author=_AUTHOR
+                ).send()
+            elif ADO_PAT:
+                await _offer_ado_push(final_tc, last_scenarios, ctx)
+        else:
+            await cl.Message(
+                content="No Critical or High priority scenarios found. Type 'generate' to start Medium/Low.",
+                author=_AUTHOR
+            ).send()
+        return
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Branch: Test Case Continuation (Pass 2)
+    # ════════════════════════════════════════════════════════════════════════
+    if intent == "testcase_continue":
+        pass2 = cl.user_session.get("pending_pass2", [])
+        if not pass2:
+            return
+            
+        p2_ids = [s["id"] for s in pass2]
+        n2 = (len(pass2) + TC_BATCH_SIZE - 1) // TC_BATCH_SIZE
+        p2_priorities = sorted({s.get("priority", "Medium") for s in pass2})
+        
         async with cl.Step(
             name=(
-                f"🧪 Generating test cases — "
-                f"{len(scenarios_to_process)} scenario(s) in {n_batches} batch(es)…"
+                f"🟡 Pass 2 — {', '.join(p2_priorities)} priority: "
+                f"{len(pass2)} scenario(s) in {n2} batch(es)…"
             )
         ) as gstep:
-            merged_tc, new_context, completed_ids = await generate_tcs_rolling(
-                scenarios=scenarios_to_process,
+            tc_text, ctx, completed = await generate_tcs_rolling(
+                scenarios=pass2,
                 llm=tc_llm,
                 retriever=retriever,
                 summary=summary,
-                verify_llm=verify_llm,   # per-batch lightweight verification
             )
-            missing_after_gen = [s for s in sc_ids if s not in completed_ids]
+            missed = [s for s in p2_ids if s not in completed]
             gstep.output = (
-                f"✅ Batches complete. Covered: {', '.join(completed_ids)}"
-                + (f" | ⚠️ Timed out: {', '.join(missing_after_gen)}" if missing_after_gen else "")
+                f"✅ Covered: {', '.join(completed)}"
+                + (f" | ⚠️ Missed: {', '.join(missed)}" if missed else "")
             )
-
-        if not merged_tc.strip():
-            await cl.Message(
-                content="⚠️ TC generation returned empty output. Please try again.",
-                author=_AUTHOR,
-            ).send()
+            
+        cl.user_session.set("pending_pass2", []) # Clear queue
+        
+        if not tc_text.strip():
+            await cl.Message(content="⚠️ Generation returned empty output.", author=_AUTHOR).send()
             return
-
-        # ── Final full-output sanitization pass ───────────────────────────────
-        # (per-batch sanitization already ran inside generate_tcs_rolling;
-        # this pass cleans any artifacts introduced during batch merging)
-        merged_tc = sanitize_test_cases(merged_tc)
-
-        # ── Verifier: format + grounding + SC coverage cross-check ───────────
-        async with cl.Step(name="🔍 Verifying test case coverage…") as vstep:
-            final_tc, verdict_label, cov_report = await verify_test_cases(
-                generated=merged_tc,
-                scenarios=last_scenarios,
-                context=new_context or last_context,
-                llm=verify_llm,
-            )
-            vstep.output = cov_report.summary()
-
-        # ── Auto gap-fill: regenerate ONLY for missing scenarios ─────────────
-        if not cov_report.is_complete and cov_report.missing_scenario_ids:
-            missing_ids = set(cov_report.missing_scenario_ids)
-            missing_dicts = [s for s in scenarios_to_process if s["id"] in missing_ids]
-
-            async with cl.Step(
-                name=f"🔄 Filling gap for: {', '.join(cov_report.missing_scenario_ids)}…"
-            ) as rstep:
-                last_tc_num = _last_tc_num(final_tc)
-                gap_text, gap_ctx = await generate_coverage_revision(
-                    missing_scenario_dicts=missing_dicts,
-                    existing_output=final_tc,
-                    llm=gen_llm,
-                    retriever=retriever,
-                    summary=summary,
-                    chat_history=chat_history,
-                    last_tc_num=last_tc_num,
-                )
-                if gap_text:
-                    final_tc = final_tc.rstrip() + "\n\n" + gap_text
-                    rstep.output = f"✅ Added TCs for {', '.join(cov_report.missing_scenario_ids)}"
-
-                    # Final cross-check after gap-fill
-                    post_coverage = check_tc_coverage(final_tc, sc_ids)
-                    if not post_coverage.is_complete:
-                        logger.warning(
-                            "Still missing after gap-fill: %s",
-                            post_coverage.missing_scenario_ids,
-                        )
-                        verdict_label = "COVERAGE_INCOMPLETE"
-                    else:
-                        verdict_label = "REVISED"
-                else:
-                    rstep.output = "⚠️ Gap-fill returned empty — manual follow-up may be needed."
-
-        # ── Store TC output for future coverage_revise requests ──────────────
-        cl.user_session.set("last_tc_output", final_tc)
-        if new_context:
-            cl.user_session.set("last_context", new_context)
-
-        chat_history, summary = _update_memory(user_input, final_tc, chat_history, summary)
-        cl.user_session.set("chat_history", chat_history)
-        cl.user_session.set("conversation_summary", summary)
-
-        # Verifier status is shown in the Step UI only — not appended to user message
+            
+        final_tc = sanitize_test_cases(tc_text)
+        
+        # Append to existing
+        existing_tc = cl.user_session.get("last_tc_output", "")
+        combined_tc = existing_tc + "\n\n" + final_tc if existing_tc else final_tc
+        cl.user_session.set("last_tc_output", combined_tc)
+        
+        final_eval = eval_tc_output(final_tc, p2_ids)
+        coverage_map = build_coverage_map(final_tc, p2_ids)
+        map_display  = format_coverage_map(coverage_map)
+        
+        async with cl.Step(name="📊 Scenario → Test Case Coverage Map") as mstep:
+            mstep.output = map_display
+            
         await cl.Message(content=final_tc, author=_AUTHOR).send()
-
-        # ── ADO push offer ───────────────────────────────────────────────────
+        
         if ADO_PAT:
-            await _offer_ado_push(final_tc, last_scenarios, new_context or last_context)
+            await _offer_ado_push(combined_tc, last_scenarios, ctx)
         return
 
 
@@ -518,12 +550,7 @@ async def _handle_coverage_revise(
     Handle user follow-up: 'you missed scenarios' / 'add missing test cases'.
     Detects what is actually missing and generates ONLY the gap.
     """
-    # Determine what context the user is working in:
-    # If TC output exists → check TC coverage gaps
-    # If only scenarios exist → notify that scenarios are stored and offer to regenerate
-
     if last_tc_output and last_scenarios_parsed:
-        # Find which SCs are missing from TC output
         sc_ids = [s["id"] for s in last_scenarios_parsed]
         cov = check_tc_coverage(last_tc_output, sc_ids)
 
@@ -569,6 +596,7 @@ async def _handle_coverage_revise(
             )
 
         if gap_text:
+            gap_text = sanitize_test_cases(gap_text)
             updated_tc = last_tc_output.rstrip() + "\n\n" + gap_text
             cl.user_session.set("last_tc_output", updated_tc)
 
@@ -584,7 +612,6 @@ async def _handle_coverage_revise(
             ).send()
 
     elif last_scenarios_parsed:
-        # User is pointing at missing scenarios (not TCs)
         sc_ids = [s["id"] for s in last_scenarios_parsed]
         await cl.Message(
             content=(

@@ -95,6 +95,8 @@ export class ChainlitClient {
         chatProfile: null,
         threadId: null,
       },
+
+
     })
 
     this.socket.on('connect', () => {

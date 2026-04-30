@@ -1,11 +1,10 @@
 """
 RAG pipeline:
-  build_index()               session-isolated Chroma vector store
-  build_llm()                 configurable ChatOllama instance
-  build_tc_llm()              faster LLM tuned for TC batch generation
-  build_chain(mode)           mode-specific retrieval chain
-  generate_tcs_rolling()      rolling batched TC generation w/ per-batch verification + sanitization
-  generate_tcs_in_batches()   alias kept for backward compatibility
+  build_index()                session-isolated Chroma vector store
+  build_llm()                  configurable ChatOllama instance
+  build_tc_llm()               LLM tuned for TC batch generation
+  build_chain(mode)            mode-specific retrieval chain
+  generate_tcs_rolling()       rolling batched TC generation w/ per-batch eval + sanitization
   generate_coverage_revision() targeted gap-fill for missing SCs
 """
 import asyncio
@@ -28,7 +27,8 @@ from app.config import (
     TC_NUM_PREDICT,
     TC_TIMEOUT_SECS,
     TC_BATCH_SIZE,
-    VERIFY_NUM_PREDICT,
+    FAST_MODE,
+    FAST_TC_NUM_PREDICT,
 )
 from app.prompts import (
     SCENARIO_SYSTEM, TC_SYSTEM, TC_SINGLE_SYSTEM,
@@ -56,14 +56,16 @@ def build_llm(temperature: float = 0.2, num_predict: int = 4000) -> ChatOllama:
 
 def build_tc_llm() -> ChatOllama:
     """
-    Build a faster LLM tuned for TC batch generation.
-    Lower num_predict + lower temperature = faster, more deterministic output.
+    Build a LLM tuned for TC batch generation.
+    Uses FAST_TC_NUM_PREDICT in fast mode, TC_NUM_PREDICT otherwise.
+    Lower temperature = more deterministic = less format drift.
     """
+    budget = FAST_TC_NUM_PREDICT if FAST_MODE else TC_NUM_PREDICT
     return ChatOllama(
         model=OLLAMA_CHAT_MODEL,
         base_url=OLLAMA_BASE_URL,
-        temperature=0.1,           # more deterministic → less rambling
-        num_predict=TC_NUM_PREDICT, # tighter output cap per batch
+        temperature=0.15,
+        num_predict=budget,
     )
 
 
@@ -156,130 +158,6 @@ def build_chain(mode: str, llm: ChatOllama, retriever):
     return chain
 
 
-async def generate_tcs_in_batches(
-    scenarios: list[dict],
-    llm: ChatOllama,
-    retriever,
-    summary: str,
-    chat_history: list,
-    batch_size: int = TC_BATCH_SIZE,
-    timeout_secs: float = TC_TIMEOUT_SECS,
-) -> tuple[str, str, list[str]]:
-    """
-    Generate test cases in batches of `batch_size` scenarios.
-
-    Design:
-      - Sends 3 scenarios per LLM call (not 1, not all)
-      - Hard timeout per batch prevents stuck generation
-      - TC numbering is continuous across all batches
-      - Returns (merged_text, merged_context, completed_sc_ids)
-    """
-    # Slice into batches of batch_size
-    batches = [
-        scenarios[i : i + batch_size]
-        for i in range(0, len(scenarios), batch_size)
-    ]
-    n_batches = len(batches)
-
-    all_outputs:  list[str] = []
-    all_contexts: list[str] = []
-    completed_ids: list[str] = []
-    global_tc_counter = 1
-
-    for batch_idx, batch in enumerate(batches):
-        batch_num = batch_idx + 1
-        batch_sc_ids = [s["id"] for s in batch]
-        logger.info(
-            "TC batch %d/%d: %s (timeout=%ss)",
-            batch_num, n_batches, batch_sc_ids, timeout_secs,
-        )
-
-        # Build compact scenario block for this batch
-        sc_block = "\n\n".join(
-            f"{s['id']}: {s['title']}"
-            + (f"\nDescription: {s['description']}" if s.get("description") else "")
-            for s in batch
-        )
-
-        tc_chain = build_chain("tc_single", llm, retriever)
-        inputs = {
-            "input": (
-                f"Generate test cases (Positive, Negative, Edge, Exception) for the "
-                f"{len(batch)} scenario(s) below. "
-                f"Start TC numbering from TC{global_tc_counter}. "
-                f"Be concise but complete."
-            ),
-            "chat_history":         [],           # don't feed full history into every batch
-            "conversation_summary": summary[-500:], # keep summary small per batch
-            "scenarios":            sc_block,
-            "existing_output":      "",
-            "missing_items":        "",
-        }
-
-        batch_output = ""
-        batch_ctx    = ""
-        try:
-            response = await asyncio.wait_for(
-                tc_chain.ainvoke(inputs),
-                timeout=timeout_secs,
-            )
-            batch_output = response.get("answer", "").strip()
-            batch_ctx    = response.get("context", "")
-
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Batch %d/%d timed out after %ss — skipping, continuing.",
-                batch_num, n_batches, timeout_secs,
-            )
-        except Exception as exc:
-            logger.error("Batch %d/%d failed: %s", batch_num, n_batches, exc)
-
-        if batch_output:
-            # Ensure each SC header is present for the coverage checker
-            for sc in batch:
-                if sc["id"].lower() not in batch_output.lower():
-                    batch_output = f"{sc['id']}: {sc['title']}\n\n" + batch_output
-
-            all_outputs.append(batch_output)
-            all_contexts.append(batch_ctx)
-            completed_ids.extend(batch_sc_ids)
-
-            # Advance global TC counter
-            tc_nums = re.findall(r"\bTC(\d+)\b", batch_output, re.IGNORECASE)
-            if tc_nums:
-                global_tc_counter = max(int(n) for n in tc_nums) + 1
-
-        logger.info(
-            "Batch %d/%d done. TC counter now: %d",
-            batch_num, n_batches, global_tc_counter,
-        )
-
-    merged_text    = "\n\n".join(all_outputs)
-    merged_context = "\n".join(all_contexts[:2])  # limit context size
-    return merged_text, merged_context, completed_ids
-
-
-# ---------------------------------------------------------------------------
-# Backward-compatible alias (coverage_revision still uses the old name)
-# ---------------------------------------------------------------------------
-async def generate_tcs_per_scenario(
-    scenarios: list[dict],
-    llm: ChatOllama,
-    retriever,
-    summary: str,
-    chat_history: list,
-) -> tuple[str, str]:
-    """Thin alias → generate_tcs_rolling with batch_size=1 (legacy path)."""
-    text, ctx, _ = await generate_tcs_rolling(
-        scenarios=scenarios,
-        llm=llm,
-        retriever=retriever,
-        summary=summary,
-        batch_size=1,
-    )
-    return text, ctx
-
-
 # ---------------------------------------------------------------------------
 # Rolling batched TC generation — primary generation path
 # ---------------------------------------------------------------------------
@@ -291,30 +169,22 @@ async def generate_tcs_rolling(
     summary: str,
     batch_size: int = TC_BATCH_SIZE,
     timeout_secs: float = TC_TIMEOUT_SECS,
-    verify_llm: ChatOllama | None = None,
 ) -> tuple[str, str, list[str]]:
     """
-    Rolling batched TC generation with per-batch verification and sanitization.
+    Rolling batched TC generation with per-batch Python eval + sanitization.
 
     Architecture:
       1. Split scenario queue into batches of batch_size.
       2. For each batch:
-           a. Generate TCs for the 3-4 scenarios in this batch only.
-           b. If verify_llm provided, run lightweight verify_tc_batch().
-           c. Run sanitize_test_cases() to fix formatting defects.
-           d. Inject SC headers for any scenario missing from batch output.
+           a. Generate TCs (single LLM call — the ONLY model call per batch).
+           b. Run eval_tc_batch() — Python-only, <10ms.
+           c. If eval finds missing SCs AND not FAST_MODE: one targeted retry.
+           d. Run sanitize_test_cases() — deterministic formatting repair.
            e. Accumulate and advance TC counter.
       3. Return (merged_text, merged_context, completed_ids).
-
-    Benefits over single-shot:
-      - Each batch gets focused context → better reasoning depth.
-      - Verifier catches format issues per batch → no cascading corruption.
-      - Sanitizer repairs each batch → clean output even if model wanders.
-      - TC counter carries forward → continuous sequential numbering.
     """
-    # Lazy import to avoid circular dependency at module load time
-    from app.sanitizer import sanitize_test_cases
-    from app.verifier import verify_tc_batch
+    from app.evals import eval_tc_batch
+    from app.sanitizer import sanitize_test_cases, renumber_test_cases
 
     batches = [
         scenarios[i : i + batch_size]
@@ -322,101 +192,155 @@ async def generate_tcs_rolling(
     ]
     n_batches = len(batches)
 
-    all_outputs:   list[str] = []
-    all_contexts:  list[str] = []
-    completed_ids: list[str] = []
-    global_tc_counter = 1
-
-    for batch_idx, batch in enumerate(batches):
-        batch_num    = batch_idx + 1
-        batch_sc_ids = [s["id"] for s in batch]
-        logger.info(
-            "Rolling TC batch %d/%d — %s  (TC counter starts at TC%d)",
-            batch_num, n_batches, batch_sc_ids, global_tc_counter,
-        )
-
-        # ── Build compact scenario block for this batch ──────────────────────
-        sc_block = "\n\n".join(
-            f"{s['id']}: {s['title']}"
-            + (f"\nDescription: {s['description']}" if s.get("description") else "")
-            for s in batch
-        )
-
-        tc_chain = build_chain("tc_single", llm, retriever)
-        inputs = {
-            "input": (
-                f"Generate exhaustive test cases for the {len(batch)} scenario(s) below. "
-                f"Start TC numbering from TC{global_tc_counter}. "
-                f"For each test category (Positive, Negative, Edge, Exception), "
-                f"generate as many meaningful variants as the feature supports — "
-                f"do not stop at one per category."
-            ),
-            "chat_history":         [],              # fresh context per batch
-            "conversation_summary": summary[-500:],  # keep prompt compact
-            "scenarios":            sc_block,
-            "existing_output":      "",
-            "missing_items":        "",
-        }
-
-        batch_output = ""
-        batch_ctx    = ""
-
-        # ── Generate ─────────────────────────────────────────────────────────
-        try:
-            response = await asyncio.wait_for(
-                tc_chain.ainvoke(inputs),
-                timeout=timeout_secs,
-            )
-            batch_output = response.get("answer", "").strip()
-            batch_ctx    = response.get("context", "")
-
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Rolling batch %d/%d timed out after %ss — skipping.",
-                batch_num, n_batches, timeout_secs,
-            )
-        except Exception as exc:
-            logger.error("Rolling batch %d/%d failed: %s", batch_num, n_batches, exc)
-
-        if not batch_output:
-            logger.warning("Batch %d/%d produced no output.", batch_num, n_batches)
-            continue
-
-        # ── Per-batch verification (optional, uses lightweight verifier) ─────
-        if verify_llm is not None:
-            batch_output, _ = await verify_tc_batch(
-                batch_text=batch_output,
-                scenarios_block=sc_block,
-                context=batch_ctx,
-                llm=verify_llm,
+    # Concurrency control: Set to 1 for local Macs! 
+    # Parallel requests sit in Ollama's queue, burning their asyncio timeout before they even start!
+    concurrency_limit = 1
+    semaphore = asyncio.Semaphore(concurrency_limit)
+    
+    async def process_batch(batch_idx: int, batch: list[dict]) -> tuple[str, str, list[str]]:
+        async with semaphore:
+            batch_num = batch_idx + 1
+            batch_sc_ids = [s["id"] for s in batch]
+            # Predict starting TC number to avoid conflicts in parallel execution
+            predicted_start_tc = (batch_idx * 10) + 1
+            
+            logger.info(
+                "Rolling batch %d/%d — %s (Starting at TC%d) [Parallel Task]",
+                batch_num, n_batches, batch_sc_ids, predicted_start_tc,
             )
 
-        # ── Per-batch sanitization (always runs) ─────────────────────────────
-        batch_output = sanitize_test_cases(batch_output)
+            sc_block = "\n\n".join(
+                f"{s['id']}: {s['title']}"
+                + (f"\nDescription: {s['description']}" if s.get("description") else "")
+                for s in batch
+            )
 
-        # ── Ensure SC headers are present for the coverage checker ───────────
-        for sc in batch:
-            if sc["id"].lower() not in batch_output.lower():
-                batch_output = f"{sc['id']}: {sc['title']}\n\n" + batch_output
+            tc_chain = build_chain("tc_single", llm, retriever)
+            inputs = {
+                "input": (
+                    f"Generate test cases for the {len(batch)} scenario(s) below. "
+                    f"Start TC numbering from TC{predicted_start_tc}. "
+                    f"Generate a mix of Positive, Negative, Edge, and Exception categories. "
+                    f"STRICT RULE: Maximum 5 test cases total per scenario. Every scenario must have at least 1 test case."
+                ),
+                "chat_history":         [],
+                "conversation_summary": summary[-500:],
+                "scenarios":            sc_block,
+                "existing_output":      "",
+                "missing_items":        "",
+            }
 
-        all_outputs.append(batch_output)
-        all_contexts.append(batch_ctx)
-        completed_ids.extend(batch_sc_ids)
+            batch_output = ""
+            batch_ctx    = ""
 
-        # ── Advance continuous TC counter across batches ─────────────────────
-        tc_nums = re.findall(r"\bTC(\d+)\b", batch_output, re.IGNORECASE)
-        if tc_nums:
-            global_tc_counter = max(int(n) for n in tc_nums) + 1
+            try:
+                response = await asyncio.wait_for(
+                    tc_chain.ainvoke(inputs),
+                    timeout=timeout_secs,
+                )
+                batch_output = response.get("answer", "").strip()
+                batch_ctx    = response.get("context", "")
+                
+                logger.debug("DEBUG batch %d scenarios: %s", batch_num, sc_block)
+                logger.debug("DEBUG batch %d output: %s", batch_num, batch_output)
 
-        logger.info(
-            "Rolling batch %d/%d complete. TC counter → TC%d",
-            batch_num, n_batches, global_tc_counter,
-        )
+            except asyncio.TimeoutError:
+                logger.warning("Batch %d/%d timed out after %ss.", batch_num, n_batches, timeout_secs)
+            except Exception as exc:
+                logger.error("Batch %d/%d failed: %s", batch_num, n_batches, exc)
+
+            if not batch_output:
+                logger.warning("Batch %d/%d produced no output. Retrying once with fallback...", batch_num, n_batches)
+                try:
+                    retry_inputs = inputs.copy()
+                    retry_inputs["input"] = (
+                        f"You MUST generate test cases for these scenarios: {batch_sc_ids}. "
+                        "Do NOT return an empty response. Output the full structured test cases now."
+                    )
+                    response = await asyncio.wait_for(
+                        tc_chain.ainvoke(retry_inputs),
+                        timeout=timeout_secs,
+                    )
+                    batch_output = response.get("answer", "").strip()
+                    batch_ctx    = response.get("context", "")
+                    logger.debug("DEBUG batch %d retry output: %s", batch_num, batch_output)
+                except Exception as exc:
+                    logger.error("Batch %d/%d retry failed: %s", batch_num, n_batches, exc)
+                    
+                if not batch_output:
+                    logger.error("Batch %d/%d still produced no output. Returning partial error.", batch_num, n_batches)
+                    batch_output = f"⚠️ [System Error] Failed to generate test cases for {batch_sc_ids} after retries."
+
+            for sc in batch:
+                if sc["id"].lower() not in batch_output.lower():
+                    batch_output = f"{sc['id']}: {sc['title']}\n\n" + batch_output
+
+            eval_result = eval_tc_batch(batch_output, batch_sc_ids)
+
+            if not eval_result.passed and eval_result.missing_sc_ids and not FAST_MODE:
+                missing_in_batch = [s for s in batch if s["id"] in set(eval_result.missing_sc_ids)]
+                if missing_in_batch:
+                    logger.info("Batch %d: retrying for missing %s", batch_num, eval_result.missing_sc_ids)
+                    retry_block = "\n\n".join(
+                        f"{s['id']}: {s['title']}"
+                        + (f"\nDescription: {s['description']}" if s.get("description") else "")
+                        for s in missing_in_batch
+                    )
+                    tc_nums = re.findall(r"\bTC(\d+)\b", batch_output, re.IGNORECASE)
+                    retry_start = max((int(n) for n in tc_nums), default=predicted_start_tc - 1) + 1
+
+                    retry_inputs = {
+                        "input": (
+                            f"Generate test cases for these {len(missing_in_batch)} missing scenario(s). "
+                            f"Start TC numbering from TC{retry_start}."
+                        ),
+                        "chat_history":         [],
+                        "conversation_summary": summary[-300:],
+                        "scenarios":            retry_block,
+                        "existing_output":      "",
+                        "missing_items":        "",
+                    }
+                    try:
+                        retry_resp = await asyncio.wait_for(
+                            tc_chain.ainvoke(retry_inputs),
+                            timeout=timeout_secs,
+                        )
+                        retry_text = retry_resp.get("answer", "").strip()
+                        if retry_text:
+                            batch_output = batch_output.rstrip() + "\n\n" + retry_text
+                            logger.info("Batch %d: retry added content for missing SCs.", batch_num)
+                    except Exception as exc:
+                        logger.warning("Batch %d retry for missing SCs failed: %s", batch_num, exc)
+
+            batch_output = sanitize_test_cases(batch_output)
+
+            return batch_output, batch_ctx, batch_sc_ids
+
+    # Execute all batches concurrently
+    logger.info("Starting parallel generation of %d batches with concurrency limit %d", n_batches, concurrency_limit)
+    tasks = [process_batch(i, b) for i, b in enumerate(batches)]
+    results = await asyncio.gather(*tasks)
+    
+    all_outputs = []
+    all_contexts = []
+    completed_ids = []
+    
+    for out_text, out_ctx, out_ids in results:
+        if out_text:
+            all_outputs.append(out_text)
+        if out_ctx:
+            all_contexts.append(out_ctx)
+        completed_ids.extend(out_ids)
 
     merged_text    = "\n\n".join(all_outputs)
+    merged_text    = renumber_test_cases(merged_text)
     merged_context = "\n".join(all_contexts[:2])
     return merged_text, merged_context, completed_ids
 
+
+# ---------------------------------------------------------------------------
+# Coverage gap-fill — targeted regeneration for missing SCs only
+# ---------------------------------------------------------------------------
 
 async def generate_coverage_revision(
     missing_scenario_dicts: list[dict],

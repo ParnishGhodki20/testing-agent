@@ -31,16 +31,14 @@ def _get_env(name: str, default, cast_type=int):
 
 
 # ---------------------------------------------------------------------------
-# Ollama
+# Ollama — single generator model (no separate verifier model)
 # ---------------------------------------------------------------------------
 
 OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
-# Generator model — used for scenario / TC / general generation
-OLLAMA_CHAT_MODEL: str = os.getenv("OLLAMA_CHAT_MODEL", "qwen2.5:7b")
-
-# Verifier model — second-pass validation (can be same or larger model)
-OLLAMA_VERIFY_MODEL: str = os.getenv("OLLAMA_VERIFY_MODEL", "qwen2.5:7b")
+# Generator model — used for ALL generation (scenarios, TCs, general QA)
+# llama3.1:8b is optimal for strict formatting and complex RAG reasoning
+OLLAMA_CHAT_MODEL: str = os.getenv("OLLAMA_CHAT_MODEL", "llama3.1:8b")
 
 # Embedding model
 OLLAMA_EMBED_MODEL: str = os.getenv("OLLAMA_EMBED_MODEL", "snowflake-arctic-embed2")
@@ -69,38 +67,50 @@ MAX_FILES: int   = _get_env("CHAINLIT_MAX_FILES", 1000)
 
 
 # ---------------------------------------------------------------------------
-# Text splitting
+# Text splitting (RAG)
 # ---------------------------------------------------------------------------
 
-CHUNK_SIZE: int    = _get_env("TEXT_SPLITTER_CHUNK_SIZE", 1500)   # aligned with .env.example
-CHUNK_OVERLAP: int = _get_env("TEXT_SPLITTER_CHUNK_OVERLAP", 150)  # 10% overlap is best practice
+# 1500 chars keeps full requirement paragraphs intact.
+# 200 overlap (~13%) preserves sentence boundaries across chunk edges.
+CHUNK_SIZE: int    = _get_env("TEXT_SPLITTER_CHUNK_SIZE", 1500)
+CHUNK_OVERLAP: int = _get_env("TEXT_SPLITTER_CHUNK_OVERLAP", 200)
 
 
 # ---------------------------------------------------------------------------
 # Retrieval
 # ---------------------------------------------------------------------------
 
-RETRIEVER_K: int       = _get_env("RETRIEVER_K", 8)        # fetch 8 chunks per query
-RETRIEVER_FETCH_K: int = _get_env("RETRIEVER_FETCH_K", 20) # MMR candidate pool
+# Fewer but higher-quality chunks: 6 × 1500 = 9000 chars of focused context
+RETRIEVER_K: int       = _get_env("RETRIEVER_K", 6)
+RETRIEVER_FETCH_K: int = _get_env("RETRIEVER_FETCH_K", 20)
 
 
 # ---------------------------------------------------------------------------
-# Test case generation performance
+# Test case generation performance (Parallel Granular Architecture)
 # ---------------------------------------------------------------------------
 
-# Scenarios per batch (3 = sweet spot for local 3b–7b models)
-TC_BATCH_SIZE: int      = _get_env("TC_BATCH_SIZE", 3)
+# Processing 1 scenario per batch ensures maximum format adherence
+TC_BATCH_SIZE: int      = _get_env("TC_BATCH_SIZE", 1)
 
-# Hard timeout per batch in seconds — prevents stuck generation
-TC_TIMEOUT_SECS: float  = _get_env("TC_TIMEOUT_SECS", 90, float)
+# Hard timeout per generation
+TC_TIMEOUT_SECS: float  = _get_env("TC_TIMEOUT_SECS", 300, float)
 
-# Max tokens the TC generator may produce per batch
-# 2500 allows ~4-6 TCs per scenario with full steps; raise to 3500 for very deep coverage
-TC_NUM_PREDICT: int     = _get_env("TC_NUM_PREDICT", 2500)
+# Token allocation per scenario (1500 is generous for 1 scenario)
+TC_NUM_PREDICT: int     = _get_env("TC_NUM_PREDICT", 1500)
 
-# Max tokens the verifier may produce (only needs a short verdict)
-VERIFY_NUM_PREDICT: int = _get_env("VERIFY_NUM_PREDICT", 1000)
 
+# ---------------------------------------------------------------------------
+# Fast mode (FAST_MODE=true in .env for demo / quick iteration)
+# ---------------------------------------------------------------------------
+# When True:
+#   - eval retries are SKIPPED (Python checks still run but don't trigger retry)
+#   - uses FAST_TC_NUM_PREDICT tokens (shorter, faster output)
+# When False (default):
+#   - one targeted retry per batch if eval detects missing SC coverage
+
+_fast_raw = os.getenv("FAST_MODE", "false").lower()
+FAST_MODE: bool          = _fast_raw in ("true", "1", "t", "yes")
+FAST_TC_NUM_PREDICT: int = _get_env("FAST_TC_NUM_PREDICT", 1200)
 
 
 # ---------------------------------------------------------------------------

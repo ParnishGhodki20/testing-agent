@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 
 # Matches SC1:, SC 1:, sc2: etc.
-_SC_ID_RE = re.compile(r"\bSC\s*(\d+)\s*:", re.IGNORECASE)
+_SC_ID_RE = re.compile(r"\bSC\s*(\d+)\s*[:\-\.]?", re.IGNORECASE)
 
 # Matches TC1:, TC 01., TC001: etc.
 _TC_ID_RE = re.compile(r"\bTC\s*(\d+)\s*[:\.]", re.IGNORECASE)

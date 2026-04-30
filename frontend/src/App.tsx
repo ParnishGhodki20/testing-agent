@@ -3,9 +3,10 @@ import type { DragEvent, ChangeEvent, KeyboardEvent } from 'react'
 import { ChainlitClient } from './chainlit'
 import type { StepDict, AskPayload, ConnectionStatus, FileRef } from './chainlit'
 import './App.css'
+import ReactMarkdown from 'react-markdown'
 
 type Role = 'user' | 'assistant'
-interface Message { id: string; role: Role; content: string; isTyping?: boolean; stepLabel?: string; streaming?: boolean }
+interface Message { id: string; role: Role; content: string; isTyping?: boolean; stepLabel?: string; streaming?: boolean; ask?: AskPayload }
 interface ChatSession { id: string; title: string; messages: Message[]; createdAt: Date }
 interface UploadedFile { file: File; id: string }
 
@@ -28,18 +29,22 @@ const IconFile = () => (<svg width="14" height="14" viewBox="0 0 24 24" fill="no
 const IconUpload = () => (<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>)
 const IconShare = () => (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>)
 const IconWifi = () => (<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>)
+const IconTrash = () => (<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>)
 
 function uid() { return Math.random().toString(36).slice(2) }
 function formatBytes(b: number) { return b < 1024 ? b + ' B' : b < 1048576 ? (b/1024).toFixed(1)+' KB' : (b/1048576).toFixed(1)+' MB' }
 
 const STATUS_COLOR: Record<ConnectionStatus, string> = { disconnected:'#6b6b6b', connecting:'#f59e0b', connected:'#10a37f', error:'#ef4444' }
 const STATUS_LABEL: Record<ConnectionStatus, string> = { disconnected:'Disconnected', connecting:'Connecting…', connected:'Connected', error:'Connection error' }
-const CHAINLIT_URL = 'http://localhost:8000'
+const CHAINLIT_URL = window.location.origin === 'http://localhost:3000' 
+  ? 'http://localhost:8000' 
+  : window.location.origin
+
 
 // ── Sidebar ──────────────────────────────────────────────────────────────────
-function Sidebar({ collapsed, sessions, activeId, status, onNewChat, onSelectSession }: {
+function Sidebar({ collapsed, sessions, activeId, status, onNewChat, onSelectSession, onDeleteSession }: {
   collapsed: boolean; sessions: ChatSession[]; activeId: string; status: ConnectionStatus
-  onNewChat: () => void; onSelectSession: (id: string) => void
+  onNewChat: () => void; onSelectSession: (id: string) => void; onDeleteSession: (id: string) => void
 }) {
   return (
     <aside className={`sidebar${collapsed ? ' collapsed' : ''}`}>
@@ -58,8 +63,14 @@ function Sidebar({ collapsed, sessions, activeId, status, onNewChat, onSelectSes
         <div className="sidebar-section-label">Recents</div>
         <div className="sidebar-history">
           {sessions.map(s => (
-            <button key={s.id} className={`history-item${s.id === activeId ? ' active' : ''}`}
-              onClick={() => onSelectSession(s.id)} title={s.title}>{s.title}</button>
+            <div key={s.id} className={`history-item-container${s.id === activeId ? ' active' : ''}`}>
+              <button className="history-item" onClick={() => onSelectSession(s.id)} title={s.title}>
+                {s.title}
+              </button>
+              <button className="history-delete-btn" onClick={(e) => { e.stopPropagation(); onDeleteSession(s.id); }} title="Delete chat">
+                <IconTrash />
+              </button>
+            </div>
           ))}
         </div>
       </>)}
@@ -124,8 +135,62 @@ function UploadModal({ onClose, onConfirm, uploading, uploadProgress }: {
   )
 }
 
+// ── Inline Upload ──
+function InlineUpload({ ask, onUpload, uploading, uploadProgress }: {
+  ask: AskPayload; onUpload: (files: File[]) => void; uploading: boolean; uploadProgress: number
+}) {
+  const inputRef = useRef<HTMLInputElement>(null)
+  const [files, setFiles] = useState<File[]>([])
+
+  const onSelect = (e: ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) {
+      const fl = Array.from(e.target.files)
+      setFiles(fl)
+      onUpload(fl)
+    }
+  }
+
+  const onDrop = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault()
+    if (e.dataTransfer.files) {
+      const fl = Array.from(e.dataTransfer.files)
+      setFiles(fl)
+      onUpload(fl)
+    }
+  }
+
+  return (
+    <div className="inline-upload" onDragOver={e => e.preventDefault()} onDrop={onDrop}>
+      <div className="inline-upload-info">
+        <span className="inline-upload-title">Drag and drop files here</span>
+        <span className="inline-upload-hint">Limit: {ask.spec.max_size_mb || 500}mb</span>
+        {files.length > 0 && (
+          <div className="inline-file-list">
+            {files.map((f, i) => (
+              <div key={i} className="inline-file-item">
+                <IconFile /> {f.name}
+              </div>
+            ))}
+          </div>
+        )}
+        {uploading && (
+          <div className="upload-progress-bar" style={{ marginTop: 8 }}>
+            <div className="upload-progress-fill" style={{ width: `${uploadProgress}%` }} />
+          </div>
+        )}
+      </div>
+      <button className="btn-pink" onClick={() => inputRef.current?.click()} disabled={uploading}>
+        <IconUpload /> {uploading ? 'Uploading...' : 'Browse Files'}
+      </button>
+      <input ref={inputRef} type="file" multiple style={{ display: 'none' }} onChange={onSelect} />
+    </div>
+  )
+}
+
 // ── Message ───────────────────────────────────────────────────────────────────
-function MessageItem({ msg }: { msg: Message }) {
+function MessageItem({ msg, onUpload, uploading, uploadProgress }: { 
+  msg: Message; onUpload?: (files: File[]) => void; uploading?: boolean; uploadProgress?: number 
+}) {
   const [copied, setCopied] = useState(false)
   const copy = () => { navigator.clipboard.writeText(msg.content); setCopied(true); setTimeout(() => setCopied(false), 1500) }
   return (
@@ -141,7 +206,12 @@ function MessageItem({ msg }: { msg: Message }) {
             </div>
           ) : (
             <>
-              <div className="message-bubble">{msg.content}</div>
+              <div className="message-bubble">
+                <ReactMarkdown>{msg.content}</ReactMarkdown>
+                {msg.ask && onUpload && (
+                  <InlineUpload ask={msg.ask} onUpload={onUpload} uploading={uploading || false} uploadProgress={uploadProgress || 0} />
+                )}
+              </div>
               {msg.role === 'assistant' && !msg.streaming && (
                 <div className="message-actions">
                   <button className="msg-action-btn" onClick={copy} title="Copy"><IconCopy /></button>
@@ -177,6 +247,7 @@ export default function App() {
   const [uploading, setUploading]           = useState(false)
   const [uploadProgress, setUploadProgress] = useState(0)
   const [status, setStatus]                 = useState<ConnectionStatus>('disconnected')
+  const [activeAskId, setActiveAskId]       = useState<string | null>(null)
 
   const pendingAskRef = useRef<((answer: unknown) => void) | null>(null)
   const textareaRef   = useRef<HTMLTextAreaElement>(null)
@@ -209,6 +280,16 @@ export default function App() {
     setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, title } : s))
   }, [])
 
+  const handleDeleteSession = useCallback((idToDelete: string) => {
+    setSessions(prev => {
+      const updated = prev.filter(s => s.id !== idToDelete)
+      if (activeIdRef.current === idToDelete) {
+        setActiveId(updated.length > 0 ? updated[0].id : '')
+      }
+      return updated
+    })
+  }, [])
+
   useEffect(() => {
     const ta = textareaRef.current; if (!ta) return
     ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'
@@ -226,7 +307,8 @@ export default function App() {
       onTaskEnd:   () => setIsLoading(false),
 
       onNewMessage: (step: StepDict) => {
-        if (step.type === 'user_message') return
+        if (step.type !== 'assistant_message' && step.type !== 'message') return
+
         const sid = activeIdRef.current
         setSessions(prev => prev.map(s => {
           if (s.id !== sid) return s
@@ -238,7 +320,9 @@ export default function App() {
       },
 
       onUpdateMessage: (step: StepDict) => {
+        if (step.type !== 'assistant_message' && step.type !== 'message') return
         const sid = activeIdRef.current
+
         setSessions(prev => prev.map(s => s.id !== sid ? s : {
           ...s, messages: s.messages.map(m => m.id === step.id
             ? { ...m, content: step.output || m.content, streaming: false } : m)
@@ -246,7 +330,9 @@ export default function App() {
       },
 
       onStreamStart: (step: StepDict) => {
+        if (step.type !== 'assistant_message' && step.type !== 'message') return
         const sid = activeIdRef.current
+
         setSessions(prev => prev.map(s => s.id !== sid ? s : {
           ...s, messages: [...s.messages.filter(m => !m.isTyping),
             { id: step.id, role: 'assistant' as Role, content: '', streaming: true }]
@@ -257,12 +343,26 @@ export default function App() {
 
       onAsk: (payload: AskPayload, respond) => {
         pendingAskRef.current = respond
-        if (payload.spec.type === 'file') setShowUpload(true)
-        addMessage(activeIdRef.current, {
-          id: payload.msg.id, role: 'assistant',
-          content: payload.msg.output || 'Please upload your documents to begin.',
-        })
+        setActiveAskId(payload.msg.id)
+        
+        const sid = activeIdRef.current
+        setSessions(prev => prev.map(s => {
+          if (s.id !== sid) return s
+          const newMsg: Message = { 
+            id: payload.msg.id, 
+            role: 'assistant', 
+            content: payload.msg.output || 'Please upload your documents to begin.',
+            ask: payload
+          }
+          // Replace typing indicator if exists
+          const typingIdx = s.messages.findIndex(m => m.isTyping)
+          if (typingIdx !== -1) { 
+            const msgs = [...s.messages]; msgs[typingIdx] = newMsg; return { ...s, messages: msgs } 
+          }
+          return { ...s, messages: [...s.messages, newMsg] }
+        }))
       },
+
 
       onError: (msg: string) => {
         addMessage(activeIdRef.current, { id: uid(), role: 'assistant', content: `⚠️ ${msg}` })
@@ -318,6 +418,7 @@ export default function App() {
         const respond = pendingAskRef.current; pendingAskRef.current = null
         respond(refs.map(r => ({ id: r.id })))
       }
+      setActiveAskId(null)
       setShowUpload(false)
     } catch (err) {
       addMessage(activeIdRef.current, { id: uid(), role: 'assistant', content: `⚠️ Upload failed: ${err}` })
@@ -329,7 +430,7 @@ export default function App() {
   return (
     <>
       <Sidebar collapsed={!sidebarOpen} sessions={sessions} activeId={activeId} status={status}
-        onNewChat={handleNewChat} onSelectSession={id => setActiveId(id)} />
+        onNewChat={handleNewChat} onSelectSession={id => setActiveId(id)} onDeleteSession={handleDeleteSession} />
 
       <div className="main">
         <div className="topbar">
@@ -345,10 +446,19 @@ export default function App() {
           {showWelcome ? (
             <div className="welcome-screen"><h1 className="welcome-title">Ready when you are.</h1></div>
           ) : (
-            <div className="messages-container">
-              {activeSession!.messages.map(msg => <MessageItem key={msg.id} msg={msg} />)}
+          <div className="messages-container">
+              {activeSession!.messages.map(msg => (
+                <MessageItem 
+                  key={msg.id} 
+                  msg={msg} 
+                  onUpload={msg.id === activeAskId ? handleUploadConfirm : undefined}
+                  uploading={msg.id === activeAskId ? uploading : false}
+                  uploadProgress={msg.id === activeAskId ? uploadProgress : 0}
+                />
+              ))}
               <div ref={bottomRef} />
             </div>
+
           )}
         </div>
 

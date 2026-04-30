@@ -81,22 +81,27 @@ def _score(normalized: str, phrase_set: frozenset[str]) -> float:
     return score
 
 
-def classify_intent(user_message: str, has_scenarios: bool = False) -> Intent:
+def classify_intent(user_message: str, has_scenarios: bool = False, has_pending_pass2: bool = False) -> Intent:
     """
     Classify intent from raw user message.
 
     Args:
         user_message:  Raw user input string.
         has_scenarios: True if the session already has stored scenarios.
+        has_pending_pass2: True if the session is waiting for confirmation to generate Medium/Low priority scenarios.
 
     Returns:
         "scenario"              — user wants scenario generation
         "testcase"              — user wants test cases (scenarios exist)
+        "testcase_continue"     — user answered yes to continuing phase 2
         "testcase_no_scenarios" — user wants test cases but no scenarios in session
         "coverage_revise"       — user is reporting missing coverage to be filled
         "general"               — general QA question
     """
     normalized = _normalize(user_message)
+
+    if has_pending_pass2 and normalized in ["yes", "y", "continue", "please do", "sure", "ok", "generate"]:
+        return "testcase_continue"
 
     # Coverage correction must be checked FIRST — it overrides other signals
     # e.g. "you missed three scenarios" scores on _SCENARIO_PHRASES too

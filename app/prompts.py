@@ -39,15 +39,45 @@ NEVER output any of these in a scenario response:
 REQUIRED OUTPUT FORMAT — follow exactly
 ══════════════════════════════════════
 SC1: [Scenario Title]
+Priority: Critical
 Description: [One-line description of what this scenario covers]
 
 SC2: [Scenario Title]
+Priority: High
 Description: [One-line description]
 
 SC3: [Scenario Title]
+Priority: Medium
 Description: [One-line description]
 
 (continue for all scenarios — be comprehensive)
+
+══════════════════════════════════════
+STRICT FOCUS & GROUNDING
+══════════════════════════════════════
+- Your focus is the FEATURE REQUIREMENTS described in the document (e.g., business logic, user flows, validations).
+- IGNORE any technical implementation details, Python scripts, or infrastructure code that might be present in the context.
+- If you see mention of 'main.py' or 'Chainlit' in the context, IGNORE IT. They are part of the tool, not the feature under test.
+- ALWAYS generate scenarios for the functional requirements found in the document. Do NOT say 'I cannot provide an answer'.
+
+══════════════════════════════════════
+PRIORITY ASSIGNMENT RULES
+══════════════════════════════════════
+
+Assign priority to each scenario based on:
+  - Business impact of failure
+  - Security / data integrity risk
+  - Workflow criticality (blocks downstream processes)
+  - Regression likelihood after changes
+  - Frequency of user interaction with this area
+
+Priority levels (use exactly one per scenario):
+  Critical — failure causes data loss, security breach, or system-wide outage
+  High     — failure breaks a core workflow or blocks users
+  Medium   — failure degrades experience but has workarounds
+  Low      — cosmetic, edge-case, or rarely triggered
+
+Order scenarios by priority: Critical first, then High, Medium, Low.
 
 ══════════════════════════════════════
 COVERAGE AREAS TO CONSIDER
@@ -286,12 +316,16 @@ For EACH category, think through ALL meaningful possibilities the feature suppor
     server errors, timeouts, network failures, partial data saves,
     interrupted workflows, database locks, session expiry during action.
 
-Depth matters. A scenario that supports 5 positive paths should have 5 positive TCs.
-Do NOT stop at one per category. Coverage should be exhaustive where the document supports it.
+Generate a MAXIMUM of 5 test cases total per scenario.
+You must include a mix of Positive, Negative, Exception, and Edge cases where applicable.
+Total test cases MUST NOT exceed 5 per scenario. Every scenario must have at least 1 test case.
 
 ══════════════════════════════════════
-REQUIRED OUTPUT FORMAT — follow exactly
+REQUIRED OUTPUT FORMAT — follow EXACTLY
 ══════════════════════════════════════
+You MUST return output. DO NOT return an empty response.
+Ensure that the Action step and the Expected Outcome are on consecutive lines. DO NOT add empty blank lines between them.
+
 {scenarios}
 
 TC1: [Test Case Title]
@@ -299,18 +333,27 @@ Type: Positive
 Preconditions:
 - [condition 1]
 - [condition 2]
+
+Steps:
+
 1. Action: [What the user/system does]
-   Expected Result: [What should happen]
+Expected Outcome: [What should happen]
 2. Action: [Next action]
-   Expected Result: [Expected outcome]
+Expected Outcome: [Expected outcome]
+
 (continue steps until fully covered)
 
 TC2: [Test Case Title]
 Type: Positive
 Preconditions:
 - [condition]
-1. Action: [action]
-   Expected Result: [result]
+
+1. Action:
+[action]
+
+Expected Outcome:
+[result]
+
 (continue — this is a DIFFERENT valid path from TC1)
 
 TC3: [Test Case Title]
@@ -332,10 +375,23 @@ Type: Exception
 (continue for as many meaningful TCs as the feature supports)
 
 ══════════════════════════════════════
+FORMATTING RULES — CRITICAL
+══════════════════════════════════════
+- Action and Expected Result MUST be on SEPARATE lines
+- NEVER combine Action and Expected Result on the same line
+- NEVER write: 1. Action: do X  Expected Result: Y
+- ALWAYS write them as separate blocks:
+    1. Action:
+    [step description]
+
+    Expected Result:
+    [what should happen]
+
+══════════════════════════════════════
 STRICT RULES
 ══════════════════════════════════════
 - Every TC must have: Title, Type, Preconditions, numbered steps
-- Every Action MUST have a corresponding Expected Result on the next line
+- Every step MUST have its own Expected Result on a SEPARATE line
 - Use as many steps as the test case requires
 - Do NOT artificially stop at one TC per category — cover all meaningful variants
 - Ground all test cases in the uploaded document

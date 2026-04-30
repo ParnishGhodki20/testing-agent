@@ -25,8 +25,8 @@ _OUTCOME_SEMAPHORE = asyncio.Semaphore(4)
 # Regex patterns
 # ---------------------------------------------------------------------------
 
-# Matches: SC1: title  /  sc 1: title  (case-insensitive)
-_SC_RE = re.compile(r"^SC\s*(\d+)\s*:\s*(.+)$", re.IGNORECASE)
+# Matches: SC1: title  /  sc 1: title  /  **SC1:** title (case-insensitive)
+_SC_RE = re.compile(r"\bSC\s*(\d+)\s*[:\-\.]?\s*(.+)$", re.IGNORECASE)
 
 # Matches: TC1: title  /  TC 01: title  /  TC001: title
 _TC_RE = re.compile(r"^TC\s*(\d+)\s*[:\.]?\s*(.+)$", re.IGNORECASE)
@@ -46,7 +46,8 @@ def parse_scenario_titles(text: str) -> list[dict]:
     """
     Extract scenario records from LLM scenario output.
 
-    Returns list of {"id": "SC1", "title": "...", "description": "..."}
+    Returns list of {"id": "SC1", "title": "...", "priority": "...", "description": "..."}
+    Priority defaults to "Medium" if not found.
     """
     results: list[dict] = []
     current: dict | None = None
@@ -56,15 +57,22 @@ def parse_scenario_titles(text: str) -> list[dict]:
         if not line:
             continue
 
-        m = _SC_RE.match(line)
+        m = _SC_RE.search(line)
         if m:
             if current:
                 results.append(current)
             current = {
                 "id": f"SC{m.group(1)}",
                 "title": m.group(2).strip(),
+                "priority": "Medium",
                 "description": "",
             }
+            continue
+
+        if current and line.lower().startswith("priority:"):
+            pval = line[len("priority:"):].strip().title()
+            if pval in ("Critical", "High", "Medium", "Low"):
+                current["priority"] = pval
             continue
 
         if current and line.lower().startswith("description:"):
@@ -74,6 +82,7 @@ def parse_scenario_titles(text: str) -> list[dict]:
         results.append(current)
 
     return results
+
 
 
 # ---------------------------------------------------------------------------

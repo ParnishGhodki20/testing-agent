@@ -57,31 +57,58 @@ _TYPE_LINE_RE = re.compile(
 
 def _fix_merged_action_er(text: str) -> str:
     """
-    Split lines where Action: and Expected Result: appear concatenated on
-    the same line. Preserves indentation.
+    Split lines where Action/step and Expected Result/Outcome appear concatenated
+    on the same line. Preserves indentation.
 
-    Before:  1. Action: Click submit  Expected Result: Modal closes
-    After:   1. Action: Click submit
-                Expected Result: Modal closes
+    Handles:
+      1. Action: Click submit  Expected Result: Modal closes
+      2. 1. Do something  Expected Outcome: Result appears
+      3. Action: Click button Expected Outcome: Page refreshes
+
+    After:
+      1. Action: Click submit
+         Expected Result: Modal closes
+
+      1. Do something
+         Expected Outcome: Result appears
     """
+    # Match Expected Result: or Expected Outcome: mid-line
+    _er_mid_re = re.compile(
+        r"Expected\s+(?:Result|Outcome)\s*:", re.IGNORECASE
+    )
+    # Match Action: or numbered step at start
+    _act_start_re = re.compile(
+        r"(?:\d+[\.\)]\s*)?(?:Action|Step)\s*:", re.IGNORECASE
+    )
+    # Match plain numbered step: "1. Do something"
+    _num_start_re = re.compile(r"\d+[\.\)]\s+")
+
     lines = text.splitlines()
     result: list[str] = []
 
     for line in lines:
-        er_m = re.search(r"Expected\s+(?:Result|Outcome)\s*:", line, re.IGNORECASE)
-        act_m = re.search(
-            r"(?:\d+[\.\)]\s*)?(?:Action|Step)\s*:", line, re.IGNORECASE
-        )
-        if er_m and act_m and er_m.start() > act_m.end() + 3:
+        er_m = _er_mid_re.search(line)
+        if not er_m:
+            result.append(line)
+            continue
+
+        # Check if there's an action/step or numbered step BEFORE the ER on the same line
+        prefix = line[:er_m.start()]
+        act_m = _act_start_re.search(prefix)
+        num_m = _num_start_re.match(prefix.lstrip())
+
+        # Only split if there's meaningful content before ER
+        if (act_m or num_m) and len(prefix.strip()) > 3:
             indent = " " * (len(line) - len(line.lstrip()))
-            action_part = line[: er_m.start()].rstrip()
+            action_part = prefix.rstrip()
             er_part     = line[er_m.start():]
             result.append(action_part)
-            result.append(indent + "   " + er_part)
+            result.append(indent + er_part.lstrip())
         else:
             result.append(line)
 
     return "\n".join(result)
+
 
 
 def _repair_placeholder_titles(text: str) -> str:
@@ -153,7 +180,31 @@ def sanitize_test_cases(text: str) -> str:
     # 4. Standardise Type: labels
     text = _standardise_type_labels(text)
 
+    # 4.5. Remove empty lines and indentation before Expected Outcome and Action steps
+    text = re.sub(r"([^\n])\n+\s*(Expected Outcome:)", r"\1\n\2", text, flags=re.IGNORECASE)
+    text = re.sub(r"([^\n])\n+\s*(\d+\.\s*Action:)", r"\1\n\2", text, flags=re.IGNORECASE)
+
     # 5. Collapse blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
+
+
+def renumber_test_cases(text: str) -> str:
+    """
+    Deterministically renumbers all 'TCn:' headings from 1 to N sequentially,
+    removing any gaps caused by parallel batch generation or LLM skipped numbers.
+    """
+    counter = 1
+    
+    def replacer(m: re.Match) -> str:
+        nonlocal counter
+        replacement = f"TC{counter}:"
+        if m.group(1):
+            replacement = m.group(1) + replacement
+        counter += 1
+        return replacement
+
+    # Matches "**TC1:**" or "TC 2:" or "TC03:"
+    # Using re.IGNORECASE to catch "tc1:" or "Tc1:"
+    return re.sub(r"(^|\n)(?:\*\*)?TC\s*\d+\s*:?(?:\*\*)?", replacer, text, flags=re.IGNORECASE)
