@@ -46,6 +46,12 @@ function Sidebar({ collapsed, sessions, activeId, status, onNewChat, onSelectSes
   collapsed: boolean; sessions: ChatSession[]; activeId: string; status: ConnectionStatus
   onNewChat: () => void; onSelectSession: (id: string) => void; onDeleteSession: (id: string) => void
 }) {
+  const [searchQuery, setSearchQuery] = useState('');
+  
+  const filteredSessions = sessions.filter(s => 
+    s.title.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+
   return (
     <aside className={`sidebar${collapsed ? ' collapsed' : ''}`}>
       <div className="sidebar-header">
@@ -54,11 +60,22 @@ function Sidebar({ collapsed, sessions, activeId, status, onNewChat, onSelectSes
         <button className="sidebar-icon-btn" onClick={onNewChat} title="New chat"><IconEdit /></button>
       </div>
       <button className="new-chat-btn" onClick={onNewChat}><IconPlus /> New chat</button>
-      <button className="sidebar-search"><IconSearch /> Search chats</button>
+      
+      <div className="sidebar-search-container">
+        <IconSearch />
+        <input 
+          type="text" 
+          placeholder="Search chats" 
+          value={searchQuery}
+          onChange={e => setSearchQuery(e.target.value)}
+          className="sidebar-search-input"
+        />
+      </div>
+
       {sessions.length > 0 && (<>
         <div className="sidebar-section-label">Recents</div>
         <div className="sidebar-history">
-          {sessions.map(s => (
+          {filteredSessions.length > 0 ? filteredSessions.map(s => (
             <div key={s.id} className={`history-item-container${s.id === activeId ? ' active' : ''}`}>
               <button className="history-item" onClick={() => onSelectSession(s.id)} title={s.title}>
                 {s.title}
@@ -67,7 +84,9 @@ function Sidebar({ collapsed, sessions, activeId, status, onNewChat, onSelectSes
                 <IconTrash />
               </button>
             </div>
-          ))}
+          )) : (
+            <div className="sidebar-empty-state">No matching chats</div>
+          )}
         </div>
       </>)}
       <div className="sidebar-footer">
@@ -244,6 +263,7 @@ export default function App() {
   const [uploadProgress, setUploadProgress] = useState(0)
   const [status, setStatus]                 = useState<ConnectionStatus>('disconnected')
   const [activeAskId, setActiveAskId]       = useState<string | null>(null)
+  const [shareCopied, setShareCopied]       = useState(false)
 
   const pendingAskRef = useRef<((answer: unknown) => void) | null>(null)
   const textareaRef   = useRef<HTMLTextAreaElement>(null)
@@ -415,7 +435,7 @@ export default function App() {
       const cleanName = rawName.replace(/\.[^/.]+$/, "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())
       
       const sid = activeIdRef.current
-      if (activeSession?.messages.length === 0) {
+      if (!activeSession || activeSession.title === 'New chat') {
         updateTitle(sid, cleanName)
         addMessage(sid, { id: uid(), role: 'user', content: `📄 ${cleanName}` })
       }
@@ -431,6 +451,41 @@ export default function App() {
     } finally { setUploading(false); setUploadProgress(0) }
   }
 
+  const handleShare = () => {
+    if (!activeSession || activeSession.messages.length === 0) return
+    let text = `# ${activeSession.title}\n\n`
+    let hasContent = false
+    
+    activeSession.messages.forEach(m => {
+      if (m.isTyping || !m.content) return
+      // Skip the default welcome message
+      if (m.content.includes('Upload one or more feature / requirement documents to begin.')) return
+      
+      const role = m.role === 'user' ? 'User' : 'Testing Copilot'
+      text += `**${role}**:\n${m.content}\n\n`
+      hasContent = true
+    })
+    
+    if (!hasContent) {
+      alert("No test cases to share yet! Generate some test cases first.")
+      return
+    }
+
+    // Create a blob and trigger download
+    const blob = new Blob([text], { type: 'text/markdown' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${activeSession.title.replace(/\s+/g, '_')}_Test_Cases.md`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+    
+    setShareCopied(true)
+    setTimeout(() => setShareCopied(false), 2000)
+  }
+
   const showWelcome = !activeSession || activeSession.messages.length === 0
 
   return (
@@ -443,7 +498,14 @@ export default function App() {
           <button className="topbar-toggle" onClick={() => setSidebarOpen(o => !o)} title="Toggle sidebar"><IconMenu /></button>
           <button className="model-selector">Testing Copilot <IconChevronDown /></button>
           <div className="topbar-actions">
-            <button className="topbar-action-btn" title="Share"><IconShare /></button>
+            <button 
+              className="topbar-action-btn" 
+              title="Download Markdown" 
+              onClick={handleShare}
+              style={shareCopied ? { width: 'auto', padding: '0 12px' } : undefined}
+            >
+              {shareCopied ? <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)' }}>Downloaded!</span> : <IconShare />}
+            </button>
             <button className="topbar-action-btn" title="More options"><IconMore /></button>
           </div>
         </div>
