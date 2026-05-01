@@ -52,6 +52,9 @@ Description: [One-line description]
 
 (continue for all scenarios — be comprehensive)
 
+IMPORTANT: The scenario title on the SC line MUST be a descriptive name (e.g. "Direct Approval via Email").
+Do NOT use "Critical", "High", "Medium", or "Low" as the title. Those words belong ONLY on the Priority: line.
+
 ══════════════════════════════════════
 STRICT FOCUS & GROUNDING
 ══════════════════════════════════════
@@ -361,7 +364,7 @@ Scenario Context:
 {scenarios}
 
 ══════════════════════════════════════
-REQUIRED OUTPUT FORMAT — follow EXACTLY
+REQUIRED OUTPUT FORMAT — copy this pattern EXACTLY
 ══════════════════════════════════════
 Preconditions:
 - [condition 1]
@@ -369,19 +372,24 @@ Preconditions:
 
 1. Action: [What the user/system does]
    Expected Outcome: [What should happen]
-
 2. Action: [Next action]
    Expected Outcome: [Expected outcome]
+3. Action: [Next action]
+   Expected Outcome: [Expected outcome]
 
-(continue steps until the test goal is fully verified)
+(continue for as many steps as required to fully verify the goal)
 
 ══════════════════════════════════════
-STRICT RULES
+STRICT RULES — follow exactly
 ══════════════════════════════════════
-- Keep steps tight and compact. Do NOT add unnecessary blank lines.
-- Action and Expected Outcome must be paired together.
-- Output ONLY the Preconditions and the numbered steps.
-- Do NOT output the Title, Type, or Goal (they are already displayed).
+- The step number, "Action:", and description MUST all be on ONE line. Example: "1. Action: User clicks Submit"
+- "Expected Outcome:" MUST be on the VERY NEXT line, indented with 3 spaces. Example: "   Expected Outcome: Form is saved"
+- Do NOT insert blank lines between steps.
+- Do NOT put the step number on a separate line from "Action:".
+- Do NOT add section headers, commentary, or extra text.
+- Generate as many steps as needed — do not stop early.
+- Output ONLY the Preconditions block and the numbered steps.
+- Do NOT repeat the Title, Type, or Goal.
 
 Document Context:
 {context}

@@ -100,3 +100,49 @@ def renumber_test_cases(text: str) -> str:
         return replacement
 
     return re.sub(r"(^|\n)(?:\*\*)?TC\s*\d+\s*:?(?:\*\*)?", replacer, text, flags=re.IGNORECASE)
+
+
+def sanitize_expansion(text: str) -> str:
+    """
+    Post-process an expanded test case to enforce compact, aligned step formatting.
+
+    Rules enforced:
+      - Strip any LLM preamble / intro lines
+      - Merge orphaned step numbers back onto the Action line
+        e.g.  "1.\nAction: foo"  →  "1. Action: foo"
+      - Remove blank lines between steps (lines starting with a digit or "Expected Outcome")
+      - Collapse 3+ consecutive blank lines to a single blank line elsewhere
+    """
+    # Strip LLM intro lines ("Here are the steps...", "Sure! Below is...")
+    text = _PREAMBLE_RE.sub("", text)
+
+    # Merge "N.\n   Action:" or "N.\nAction:" onto one line
+    # Handles: "1.\n   Action: foo" → "1. Action: foo"
+    text = re.sub(
+        r"(\d+)\.\s*\n\s*(Action\s*:)",
+        r"\1. \2",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove blank lines that appear between a step's Action line and its Expected Outcome line
+    # i.e. "Action: ...\n\nExpected Outcome:" → "Action: ...\nExpected Outcome:"
+    text = re.sub(
+        r"(Action\s*:[^\n]*)\n{2,}(\s*Expected\s+Outcome\s*:)",
+        r"\1\n\2",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove blank lines between "Expected Outcome: ..." and the next numbered step
+    text = re.sub(
+        r"(Expected\s+Outcome\s*:[^\n]*)\n{2,}(\s*\d+\.\s*Action\s*:)",
+        r"\1\n\2",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Collapse any remaining 3+ blank lines to one blank line
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+

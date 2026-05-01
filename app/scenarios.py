@@ -61,9 +61,15 @@ def parse_scenario_titles(text: str) -> list[dict]:
         if m:
             if current:
                 results.append(current)
+            raw_title = m.group(2).strip()
+            # Guard: if the LLM collapsed Priority into the title
+            # (e.g. "SC3: Medium"), clear it — the Priority: line that follows will be used.
+            _PRIORITY_WORDS = {"critical", "high", "medium", "low"}
+            if raw_title.lower() in _PRIORITY_WORDS:
+                raw_title = ""   # will be filled in from context below
             current = {
                 "id": f"SC{m.group(1)}",
-                "title": m.group(2).strip(),
+                "title": raw_title,
                 "priority": "Medium",
                 "description": "",
             }
@@ -73,6 +79,9 @@ def parse_scenario_titles(text: str) -> list[dict]:
             pval = line[len("priority:"):].strip().title()
             if pval in ("Critical", "High", "Medium", "Low"):
                 current["priority"] = pval
+                # If title is blank (LLM collapsed priority into title), build a placeholder
+                if not current["title"]:
+                    current["title"] = f"{pval} Priority Scenario"
             continue
 
         if current and line.lower().startswith("description:"):

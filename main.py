@@ -35,7 +35,7 @@ from app.rag import (
     build_chain, build_index, build_llm, build_tc_llm,
     generate_tcs_rolling, generate_coverage_revision, expand_test_case
 )
-from app.sanitizer import sanitize_scenarios, sanitize_test_cases
+from app.sanitizer import sanitize_scenarios, sanitize_test_cases, sanitize_expansion
 from app.router import classify_intent
 from app.scenarios import (
     generate_expected_outcomes,
@@ -501,7 +501,8 @@ async def on_message(message: cl.Message):
             await cl.Message(content=f"⚠️ Failed to generate steps for {tc_id}.", author=_AUTHOR).send()
             return
 
-        final_steps = steps_text.strip()
+        # Enforce compact step formatting (no blank lines between steps, no orphaned step numbers)
+        final_steps = sanitize_expansion(steps_text)
         
         # Save to cache
         expanded_tcs[tc_id] = (tc_title, tc_type, tc_goal, final_steps, ctx)
