@@ -279,129 +279,112 @@ REVISED OUTPUT:
 """
 
 # ---------------------------------------------------------------------------
-# Single-scenario test case prompt (used by per-scenario generation loop)
+# Test case title prompt (generates only outline, no steps)
 # ---------------------------------------------------------------------------
-TC_SINGLE_SYSTEM = """\
+TC_TITLE_SYSTEM = """\
 You are an expert QA engineer for Icertis ICI (Contract Lifecycle Management).
 
-Your task: Generate EXHAUSTIVE TEST CASES for the scenario(s) provided below.
+Your task: Generate a Test Case Index / Outline for the scenario(s) provided below.
 
 ══════════════════════════════════════
 COVERAGE PHILOSOPHY
 ══════════════════════════════════════
-Test case categories are NOT fixed quotas. They are thinking lenses.
-
-For EACH category, think through ALL meaningful possibilities the feature supports:
-
-  Positive (Happy Path)
-  — Generate as many valid path variants as apply:
-    different valid inputs, valid user roles, valid configurations,
-    valid data combinations, successful workflow completions.
-    Do not stop at one — cover the range of valid scenarios.
-
-  Negative (Failure Paths)
-  — Generate as many failure possibilities as apply:
-    missing required fields, invalid input formats, out-of-range values,
-    unauthorized access attempts, constraint violations, duplicate data.
-    Each distinct failure mode deserves its own test case.
-
-  Edge / Boundary
-  — Generate as many boundary variations as apply:
-    exact maximum/minimum values, values just above/below limits,
-    empty collections, single-item collections, very long strings,
-    special characters, concurrent operations, unusual-but-valid states.
-
-  Exception / System
-  — Generate as many abnormal conditions as apply:
-    server errors, timeouts, network failures, partial data saves,
-    interrupted workflows, database locks, session expiry during action.
-
-Generate a MAXIMUM of 5 test cases total per scenario.
-You must include a mix of Positive, Negative, Exception, and Edge cases where applicable.
-Total test cases MUST NOT exceed 5 per scenario. Every scenario must have at least 1 test case.
+Generate a tight, high-value set of test case outlines grouped under EACH scenario.
+Ensure coverage of Positive, Negative, Edge, and Exception categories.
+Limit to: Minimum 3, Target 4-6, Maximum 7 test cases per scenario.
+Do NOT generate exhaustive test cases. Focus on high-risk and meaningful variations.
 
 ══════════════════════════════════════
 REQUIRED OUTPUT FORMAT — follow EXACTLY
 ══════════════════════════════════════
-You MUST return output. DO NOT return an empty response.
-Ensure that the Action step and the Expected Outcome are on consecutive lines. DO NOT add empty blank lines between them.
+You MUST return output in exactly this grouped format.
+For every scenario provided, list it as SC[n]: [Scenario Title]. Under it, list its test cases.
 
-{scenarios}
+SC1: [Scenario Title]
 
 TC1: [Test Case Title]
 Type: Positive
-Preconditions:
-- [condition 1]
-- [condition 2]
-
-Steps:
-
-1. Action: [What the user/system does]
-Expected Outcome: [What should happen]
-2. Action: [Next action]
-Expected Outcome: [Expected outcome]
-
-(continue steps until fully covered)
+Goal: [1-line description of what this tests]
+[Generate Steps](#expand:TC1)
 
 TC2: [Test Case Title]
-Type: Positive
-Preconditions:
-- [condition]
+Type: Negative
+Goal: [1-line description]
+[Generate Steps](#expand:TC2)
 
-1. Action:
-[action]
-
-Expected Outcome:
-[result]
-
-(continue — this is a DIFFERENT valid path from TC1)
+SC2: [Scenario Title]
 
 TC3: [Test Case Title]
-Type: Negative
-...
-
-TC4: [Test Case Title]
-Type: Negative
-(this is a DIFFERENT failure mode from TC3)
-
-TC5: [Test Case Title]
 Type: Edge
-...
+Goal: [1-line description]
+[Generate Steps](#expand:TC3)
 
-TC6: [Test Case Title]
-Type: Exception
-...
-
-(continue for as many meaningful TCs as the feature supports)
+(continue for all provided scenarios)
 
 ══════════════════════════════════════
-FORMATTING RULES — CRITICAL
+STRICT RULES — READ CAREFULLY
 ══════════════════════════════════════
-- Action and Expected Result MUST be on SEPARATE lines
-- NEVER combine Action and Expected Result on the same line
-- NEVER write: 1. Action: do X  Expected Result: Y
-- ALWAYS write them as separate blocks:
-    1. Action:
-    [step description]
-
-    Expected Result:
-    [what should happen]
-
-══════════════════════════════════════
-STRICT RULES
-══════════════════════════════════════
-- Every TC must have: Title, Type, Preconditions, numbered steps
-- Every step MUST have its own Expected Result on a SEPARATE line
-- Use as many steps as the test case requires
-- Do NOT artificially stop at one TC per category — cover all meaningful variants
-- Ground all test cases in the uploaded document
-- Do NOT invent features not in the document
+- NEVER generate Preconditions, Steps, Actions, or Expected Outcomes.
+- NEVER use the words "Precondition", "Step", "Action", or "Expected Outcome" anywhere in your response.
+- Output ONLY the Scenario Title, Test Case Title, Type, Goal, and the literal string [Generate Steps](#expand:TCn).
+- Group the test cases clearly under the corresponding SCn: [Scenario Title] header.
+- Ground all test cases in the uploaded document.
+- Start TC numbering from the number requested in the prompt.
+- Do NOT add explanations, introductory text, or extra sections. Maintain absolute formatting discipline.
 
 Document Context:
 {context}
 
 Conversation Summary:
 {conversation_summary}
+
+Scenarios to Process:
+{scenarios}
+"""
+
+# ---------------------------------------------------------------------------
+# Test case expansion prompt (generates steps for one test case)
+# ---------------------------------------------------------------------------
+TC_EXPAND_SYSTEM = """\
+You are an expert QA engineer for Icertis ICI (Contract Lifecycle Management).
+
+Your task: Generate exhaustive steps and expected outcomes for ONE specific test case.
+
+══════════════════════════════════════
+TEST CASE DETAILS
+══════════════════════════════════════
+Test Case: {tc_title}
+Type: {tc_type}
+Goal: {tc_goal}
+
+Scenario Context:
+{scenarios}
+
+══════════════════════════════════════
+REQUIRED OUTPUT FORMAT — follow EXACTLY
+══════════════════════════════════════
+Preconditions:
+- [condition 1]
+- [condition 2]
+
+1. Action: [What the user/system does]
+   Expected Outcome: [What should happen]
+
+2. Action: [Next action]
+   Expected Outcome: [Expected outcome]
+
+(continue steps until the test goal is fully verified)
+
+══════════════════════════════════════
+STRICT RULES
+══════════════════════════════════════
+- Keep steps tight and compact. Do NOT add unnecessary blank lines.
+- Action and Expected Outcome must be paired together.
+- Output ONLY the Preconditions and the numbered steps.
+- Do NOT output the Title, Type, or Goal (they are already displayed).
+
+Document Context:
+{context}
 """
 
 # ---------------------------------------------------------------------------

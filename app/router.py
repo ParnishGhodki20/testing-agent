@@ -5,7 +5,7 @@ Uses phrase-scoring + regex heuristics. No LLM call required.
 import re
 from typing import Literal
 
-Intent = Literal["scenario", "testcase", "testcase_no_scenarios", "coverage_revise", "general"]
+Intent = Literal["scenario", "testcase", "testcase_no_scenarios", "testcase_expand", "coverage_revise", "general"]
 
 # ---------------------------------------------------------------------------
 # Keyword / phrase sets — include common typos and abbreviations
@@ -102,6 +102,10 @@ def classify_intent(user_message: str, has_scenarios: bool = False, has_pending_
 
     if has_pending_pass2 and normalized in ["yes", "y", "continue", "please do", "sure", "ok", "generate"]:
         return "testcase_continue"
+
+    # Match expand tc
+    if re.search(r"^expand tc\s*\d+", normalized):
+        return "testcase_expand"
 
     # Coverage correction must be checked FIRST — it overrides other signals
     # e.g. "you missed three scenarios" scores on _SCENARIO_PHRASES too

@@ -33,7 +33,7 @@ from app.evals import eval_scenarios, eval_tc_output, build_coverage_map, format
 from app.extractors import extract_text
 from app.rag import (
     build_chain, build_index, build_llm, build_tc_llm,
-    generate_tcs_rolling, generate_coverage_revision,
+    generate_tcs_rolling, generate_coverage_revision, expand_test_case
 )
 from app.sanitizer import sanitize_scenarios, sanitize_test_cases
 from app.router import classify_intent
@@ -224,7 +224,7 @@ async def on_message(message: cl.Message):
 
     # ── Intent classification ────────────────────────────────────────────────
     intent = classify_intent(user_input, has_scenarios=bool(last_scenarios), has_pending_pass2=bool(pending_pass2))
-    logger.info("Intent: '%s' | has_scenarios: %s", intent, bool(last_scenarios))
+    logger.info("Intent: '%s' | input: '%s'", intent, user_input[:80])
 
     # ════════════════════════════════════════════════════════════════════════
     # Branch: No scenarios yet for TC request
@@ -387,7 +387,7 @@ async def on_message(message: cl.Message):
         return
 
     # ════════════════════════════════════════════════════════════════════════
-    # Branch: Test case generation (prioritised multi-pass + rolling batches)
+    # Branch: Test case generation (Title-First Pass)
     # ════════════════════════════════════════════════════════════════════════
     if intent == "testcase":
         scenarios_to_process = last_scenarios_parsed or parse_scenario_titles(last_scenarios)
@@ -403,132 +403,122 @@ async def on_message(message: cl.Message):
             return
 
         sc_ids = [s["id"] for s in scenarios_to_process]
-
-        # ── Split scenarios by priority into two passes ───────────────────────
-        pass1 = [s for s in scenarios_to_process if s.get("priority", "Medium") in ("Critical", "High")]
-        pass2 = [s for s in scenarios_to_process if s.get("priority", "Medium") in ("Medium", "Low")]
         
-        # Save Medium/Low to session for conditional step
-        cl.user_session.set("pending_pass2", pass2)
-        
-        if pass1:
-            p1_ids = [s["id"] for s in pass1]
-            n1 = (len(pass1) + TC_BATCH_SIZE - 1) // TC_BATCH_SIZE
-            p1_priorities = sorted({s.get("priority", "Medium") for s in pass1})
-            
-            async with cl.Step(
-                name=(
-                    f"🔴 Pass 1 — {', '.join(p1_priorities)} priority: "
-                    f"{len(pass1)} scenario(s) in {n1} batch(es)…"
-                )
-            ) as gstep:
-                tc_text, ctx, completed = await generate_tcs_rolling(
-                    scenarios=pass1,
-                    llm=tc_llm,
-                    retriever=retriever,
-                    summary=summary,
-                )
-                missed = [s for s in p1_ids if s not in completed]
-                gstep.output = (
-                    f"✅ Covered: {', '.join(completed)}"
-                    + (f" | ⚠️ Missed: {', '.join(missed)}" if missed else "")
-                )
-            
-            if not tc_text.strip():
-                await cl.Message(
-                    content="⚠️ TC generation returned empty output. Please try again.",
-                    author=_AUTHOR,
-                ).send()
-                return
-
-            final_tc = sanitize_test_cases(tc_text)
-            
-            # Update memory
-            cl.user_session.set("last_tc_output", final_tc)
-            cl.user_session.set("last_context", ctx)
-            
-            # Post generation evaluation
-            final_eval = eval_tc_output(final_tc, p1_ids)
-            coverage_map = build_coverage_map(final_tc, p1_ids)
-            map_display  = format_coverage_map(coverage_map)
-            
-            async with cl.Step(name="📊 Scenario → Test Case Coverage Map") as mstep:
-                mstep.output = map_display
-                
-            chat_history, summary = _update_memory(user_input, final_tc, chat_history, summary)
-            cl.user_session.set("chat_history", chat_history)
-            cl.user_session.set("conversation_summary", summary)
-            
-            await cl.Message(content=final_tc, author=_AUTHOR).send()
-            
-            if pass2:
-                await cl.Message(
-                    content="**Test cases for Critical and High priority scenarios are ready.**\n\nDo you want me to generate test cases for Medium and Low priority scenarios as well?",
-                    author=_AUTHOR
-                ).send()
-            elif ADO_PAT:
-                await _offer_ado_push(final_tc, last_scenarios, ctx)
-        else:
-            await cl.Message(
-                content="No Critical or High priority scenarios found. Type 'generate' to start Medium/Low.",
-                author=_AUTHOR
-            ).send()
-        return
-
-    # ════════════════════════════════════════════════════════════════════════
-    # Branch: Test Case Continuation (Pass 2)
-    # ════════════════════════════════════════════════════════════════════════
-    if intent == "testcase_continue":
-        pass2 = cl.user_session.get("pending_pass2", [])
-        if not pass2:
-            return
-            
-        p2_ids = [s["id"] for s in pass2]
-        n2 = (len(pass2) + TC_BATCH_SIZE - 1) // TC_BATCH_SIZE
-        p2_priorities = sorted({s.get("priority", "Medium") for s in pass2})
+        # Determine priority mix for display
+        priorities_present = sorted(list({s.get("priority", "Medium") for s in scenarios_to_process}))
         
         async with cl.Step(
-            name=(
-                f"🟡 Pass 2 — {', '.join(p2_priorities)} priority: "
-                f"{len(pass2)} scenario(s) in {n2} batch(es)…"
-            )
+            name=f"📋 Generating Test Plan for {len(scenarios_to_process)} scenario(s) ({', '.join(priorities_present)})…"
         ) as gstep:
             tc_text, ctx, completed = await generate_tcs_rolling(
-                scenarios=pass2,
+                scenarios=scenarios_to_process,
                 llm=tc_llm,
                 retriever=retriever,
                 summary=summary,
             )
-            missed = [s for s in p2_ids if s not in completed]
+            missed = [s for s in sc_ids if s not in completed]
             gstep.output = (
-                f"✅ Covered: {', '.join(completed)}"
+                f"✅ Outlines generated: {', '.join(completed)}"
                 + (f" | ⚠️ Missed: {', '.join(missed)}" if missed else "")
             )
-            
-        cl.user_session.set("pending_pass2", []) # Clear queue
         
         if not tc_text.strip():
-            await cl.Message(content="⚠️ Generation returned empty output.", author=_AUTHOR).send()
+            await cl.Message(
+                content="⚠️ TC outline generation returned empty output. Please try again.",
+                author=_AUTHOR,
+            ).send()
             return
-            
+
+        # Run sanitizer: strips preamble headers, hallucinated steps,
+        # and injects any missing [Generate Steps] links.
         final_tc = sanitize_test_cases(tc_text)
         
-        # Append to existing
-        existing_tc = cl.user_session.get("last_tc_output", "")
-        combined_tc = existing_tc + "\n\n" + final_tc if existing_tc else final_tc
-        cl.user_session.set("last_tc_output", combined_tc)
+        # Update memory
+        cl.user_session.set("last_tc_output", final_tc)
+        cl.user_session.set("last_context", ctx)
         
-        final_eval = eval_tc_output(final_tc, p2_ids)
-        coverage_map = build_coverage_map(final_tc, p2_ids)
-        map_display  = format_coverage_map(coverage_map)
+        chat_history, summary = _update_memory(user_input, final_tc, chat_history, summary)
+        cl.user_session.set("chat_history", chat_history)
+        cl.user_session.set("conversation_summary", summary)
         
-        async with cl.Step(name="📊 Scenario → Test Case Coverage Map") as mstep:
-            mstep.output = map_display
+        await cl.Message(
+            content=f"**Test Plan Ready**\n\n{final_tc}\n\n*Click 'Generate Steps' on any test case to expand it.*", 
+            author=_AUTHOR
+        ).send()
+        return
+
+    # ════════════════════════════════════════════════════════════════════════
+    # Branch: Test Case Expansion (On-Demand)
+    # ════════════════════════════════════════════════════════════════════════
+    if intent == "testcase_expand":
+        tc_match = re.search(r"expand tc\s*(\d+)", user_input, re.IGNORECASE)
+        if not tc_match:
+            logger.warning("testcase_expand intent matched but no TC number found in: '%s'", user_input)
+            return
             
-        await cl.Message(content=final_tc, author=_AUTHOR).send()
+        tc_num = tc_match.group(1)
+        tc_id = f"TC{tc_num}"
+        logger.info(">>> expand_test_case triggered for %s", tc_id)
+        
+        # 5. Add Expansion Caching
+        expanded_tcs = cl.user_session.get("expanded_tcs", {})
+        if tc_id in expanded_tcs:
+            tc_title, tc_type, tc_goal, final_steps, ctx = expanded_tcs[tc_id]
+            display_text = f"### {tc_id}: {tc_title}\n**Type:** {tc_type}\n**Goal:** {tc_goal}\n\n*Loaded from cache.*\n\n{final_steps}"
+            await cl.Message(content=display_text, author=_AUTHOR).send()
+            
+            if ADO_PAT:
+                await _offer_ado_push_single(tc_id, tc_title, final_steps, last_scenarios, ctx)
+            return
+        
+        # Parse last_tc_output to find the TC details
+        # Format: TC1: [Title] \n Type: [Type] \n Goal: [Goal]
+        outline_match = re.search(rf"(?:^|\n)(?:\*\*)?{tc_id}:(?:\*\*)?\s*(.+?)\n(?:Type|Type\s*:)\s*(.+?)\n(?:Goal|Goal\s*:)\s*(.+?)\n", last_tc_output, re.IGNORECASE | re.DOTALL)
+        
+        if outline_match:
+            tc_title = outline_match.group(1).strip()
+            tc_type = outline_match.group(2).strip()
+            tc_goal = outline_match.group(3).strip()
+        else:
+            # Fallback if parsing fails
+            tc_title = f"{tc_id} Expansion"
+            tc_type = "Standard"
+            tc_goal = "Verify the expected behavior"
+
+        async with cl.Step(name=f"⚡ Generating steps for {tc_id}…") as estep:
+            steps_text, ctx = await expand_test_case(
+                tc_title=tc_title,
+                tc_type=tc_type,
+                tc_goal=tc_goal,
+                scenario_context=last_scenarios,
+                llm=tc_llm,
+                retriever=retriever,
+                summary=summary,
+            )
+            estep.output = f"✅ Steps generated for {tc_id}"
+
+        if not steps_text.strip():
+            await cl.Message(content=f"⚠️ Failed to generate steps for {tc_id}.", author=_AUTHOR).send()
+            return
+
+        final_steps = steps_text.strip()
+        
+        # Save to cache
+        expanded_tcs[tc_id] = (tc_title, tc_type, tc_goal, final_steps, ctx)
+        cl.user_session.set("expanded_tcs", expanded_tcs)
+        
+        display_text = f"### {tc_id}: {tc_title}\n**Type:** {tc_type}\n**Goal:** {tc_goal}\n\n{final_steps}"
+        
+        # Append to chat
+        chat_history, summary = _update_memory(user_input, display_text, chat_history, summary)
+        cl.user_session.set("chat_history", chat_history)
+        cl.user_session.set("conversation_summary", summary)
+        
+        await cl.Message(content=display_text, author=_AUTHOR).send()
         
         if ADO_PAT:
-            await _offer_ado_push(combined_tc, last_scenarios, ctx)
+            await _offer_ado_push_single(tc_id, tc_title, final_steps, last_scenarios, ctx)
+            
         return
 
 
@@ -634,13 +624,15 @@ async def _handle_coverage_revise(
 
 
 # ---------------------------------------------------------------------------
-# ADO push flow
+# ADO push flow (Single TC)
 # ---------------------------------------------------------------------------
 
-async def _offer_ado_push(tc_text: str, scenarios: str, context: str) -> None:
-    """Multi-step ADO push conversation."""
+async def _offer_ado_push_single(
+    tc_id: str, tc_title: str, steps_text: str, scenarios: str, context: str
+) -> None:
+    """Multi-step ADO push conversation for a single test case."""
     push_action = await cl.AskActionMessage(
-        content="🚀 Test cases generated. Push to Azure DevOps?",
+        content=f"🚀 Steps generated for {tc_id}. Push this test case to Azure DevOps?",
         actions=[
             cl.Action(name="yes", value="yes", label="✅ Yes, push to ADO"),
             cl.Action(name="no",  value="no",  label="❌ No, skip"),
@@ -651,17 +643,55 @@ async def _offer_ado_push(tc_text: str, scenarios: str, context: str) -> None:
         await cl.Message(content="ADO push skipped.", author=_AUTHOR).send()
         return
 
-    test_cases = parse_test_cases(tc_text)
-    if not test_cases:
+    # Extract steps and preconditions directly
+    preconditions = []
+    steps = []
+    raw_exp = []
+    
+    in_preconditions = False
+    last_step_idx = -1
+
+    for line in steps_text.splitlines():
+        line = line.strip()
+        if not line: continue
+        
+        low = line.lower()
+        if low.startswith("precondition"):
+            in_preconditions = True
+            continue
+            
+        if in_preconditions and line.startswith("-"):
+            preconditions.append(line[1:].strip())
+            continue
+            
+        from app.scenarios import _STEP_RE, _ER_RE
+        step_m = _STEP_RE.match(line)
+        if step_m:
+            in_preconditions = False
+            steps.append(step_m.group(1).strip())
+            raw_exp.append("")
+            last_step_idx += 1
+            continue
+            
+        er_m = _ER_RE.match(line)
+        if er_m and last_step_idx >= 0:
+            raw_exp[last_step_idx] = er_m.group(1).strip()
+            continue
+            
+        # Continuation
+        if last_step_idx >= 0 and raw_exp[last_step_idx]:
+            raw_exp[last_step_idx] += " " + line
+
+    if not steps:
         await cl.Message(
-            content="⚠️ Could not parse any test cases from the output. ADO push skipped.",
+            content="⚠️ Could not parse steps from the output. ADO push skipped.",
             author=_AUTHOR,
         ).send()
         return
 
     # Priority
     priority_msg = await cl.AskUserMessage(
-        content="Priority for all test cases? Enter 1 (High), 2 (Medium), or 3 (Low):",
+        content="Priority for this test case? Enter 1 (High), 2 (Medium), or 3 (Low):",
         timeout=60,
     ).send()
     try:
@@ -673,7 +703,7 @@ async def _offer_ado_push(tc_text: str, scenarios: str, context: str) -> None:
 
     # Regression
     regression_action = await cl.AskActionMessage(
-        content="Mark as Regression Tests?",
+        content="Mark as a Regression Test?",
         actions=[
             cl.Action(name="yes", value="yes", label="✅ Yes"),
             cl.Action(name="no",  value="no",  label="❌ No"),
@@ -681,40 +711,35 @@ async def _offer_ado_push(tc_text: str, scenarios: str, context: str) -> None:
     ).send()
     regression = (regression_action or {}).get("value") == "yes"
 
-    results: list[str] = []
-    async with cl.Step(name=f"🚀 Pushing {len(test_cases)} test cases to ADO…"):
-        for tc in test_cases:
-            steps   = [s["action"]   for s in tc["steps"]]
-            raw_exp = [s["expected"] for s in tc["steps"]]
+    outcomes = []
+    for i, exp in enumerate(raw_exp):
+        if exp:
+            outcomes.append(exp)
+        else:
+            from app.scenarios import generate_expected_outcomes
+            filled = await generate_expected_outcomes([steps[i]])
+            outcomes.append(filled[0] if filled else "")
 
-            outcomes = []
-            for i, exp in enumerate(raw_exp):
-                if exp:
-                    outcomes.append(exp)
-                else:
-                    filled = await generate_expected_outcomes([steps[i]])
-                    outcomes.append(filled[0] if filled else "")
-
-            result = await asyncio.to_thread(
-                create_test_case,
-                title          = f"[{tc['scenario_id']}] {tc['title']}",
-                precondition   = "\n".join(tc.get("preconditions", [])),
-                steps          = steps,
-                outcomes       = outcomes,
-                priority       = priority,
-                regression     = regression,
-                area_path      = ADO_AREA_PATH,
-                iteration_path = ADO_ITERATION_PATH,
-                base_url       = ADO_BASE_URL,
-                project        = ADO_PROJECT,
-                feature_id     = ADO_FEATURE_ID,
-                assigned_to    = ADO_ASSIGNED_TO,
-                tag            = ADO_TAG,
-                pat            = ADO_PAT,
-            )
-            results.append(f"**{tc['id']}** — {tc['title']}: {result}")
+    async with cl.Step(name=f"🚀 Pushing {tc_id} to ADO…"):
+        result = await asyncio.to_thread(
+            create_test_case,
+            title          = f"[{tc_id}] {tc_title}",
+            precondition   = "\n".join(preconditions),
+            steps          = steps,
+            outcomes       = outcomes,
+            priority       = priority,
+            regression     = regression,
+            area_path      = ADO_AREA_PATH,
+            iteration_path = ADO_ITERATION_PATH,
+            base_url       = ADO_BASE_URL,
+            project        = ADO_PROJECT,
+            feature_id     = ADO_FEATURE_ID,
+            assigned_to    = ADO_ASSIGNED_TO,
+            tag            = ADO_TAG,
+            pat            = ADO_PAT,
+        )
 
     await cl.Message(
-        content=f"✅ ADO push complete:\n\n" + "\n".join(results),
+        content=f"✅ ADO push complete:\n\n**{tc_id}** — {tc_title}: {result}",
         author=_AUTHOR,
     ).send()

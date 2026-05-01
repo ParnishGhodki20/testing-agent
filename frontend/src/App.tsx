@@ -203,8 +203,8 @@ function InlineUpload({ ask, onUpload, uploading, uploadProgress }: {
 }
 
 // ── Message ───────────────────────────────────────────────────────────────────
-function MessageItem({ msg, onUpload, uploading, uploadProgress }: { 
-  msg: Message; onUpload?: (files: File[]) => void; uploading?: boolean; uploadProgress?: number 
+function MessageItem({ msg, onUpload, uploading, uploadProgress, onQuickSend }: { 
+  msg: Message; onUpload?: (files: File[]) => void; uploading?: boolean; uploadProgress?: number; onQuickSend?: (text: string) => void 
 }) {
   const [copied, setCopied] = useState(false)
   const copy = () => { navigator.clipboard.writeText(msg.content); setCopied(true); setTimeout(() => setCopied(false), 1500) }
@@ -222,7 +222,46 @@ function MessageItem({ msg, onUpload, uploading, uploadProgress }: {
           ) : (
             <>
               <div className="message-bubble">
-                <ReactMarkdown>{msg.content}</ReactMarkdown>
+                <ReactMarkdown
+                  components={{
+                    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+                    a: ({ node: _node, href, children, ...rest }) => {
+                      if (href?.startsWith('#expand:')) {
+                        // "#expand:TC3" → "TC3"
+                        const tcId = href.split(':').slice(1).join(':')
+                        return (
+                          <button
+                            style={{
+                              marginTop: 8,
+                              display: 'inline-block',
+                              padding: '5px 14px',
+                              fontSize: 12,
+                              fontWeight: 600,
+                              cursor: 'pointer',
+                              borderRadius: 6,
+                              border: '1px solid var(--border)',
+                              background: 'var(--surface)',
+                              color: 'var(--accent)',
+                            }}
+                            onClick={(e) => {
+                              e.preventDefault()
+                              e.stopPropagation()
+                              const cmd = `Expand ${tcId}`
+                              console.log('[TestingCopilot] expand clicked:', cmd)
+                              if (onQuickSend) onQuickSend(cmd)
+                            }}
+                          >
+                            {children}
+                          </button>
+                        )
+                      }
+                      // Regular links: open in new tab, never navigate in-app
+                      return <a href={href} target="_blank" rel="noreferrer" {...rest}>{children}</a>
+                    },
+                  }}
+                >
+                  {msg.content}
+                </ReactMarkdown>
                 {msg.ask && onUpload && (
                   <InlineUpload ask={msg.ask} onUpload={onUpload} uploading={uploading || false} uploadProgress={uploadProgress || 0} />
                 )}
@@ -412,6 +451,24 @@ export default function App() {
     }
   }, [input, isLoading, activeSession, createSession, updateTitle, addMessage])
 
+  const handleQuickSend = useCallback((text: string) => {
+    if (!text || isLoading) return
+    let sid = activeIdRef.current
+    if (!sid) sid = createSession(text.slice(0, 40))
+    addMessage(sid, { id: uid(), role: 'user', content: text })
+
+    const isExpand = text.toLowerCase().startsWith('expand tc');
+    const label = isExpand ? `Generating steps for ${text.split(' ')[1]}…` : 'Thinking…';
+
+    if (pendingAskRef.current) {
+      const respond = pendingAskRef.current; pendingAskRef.current = null
+      respond({ id: uid(), output: text, type: 'user_message', createdAt: new Date().toISOString() })
+    } else {
+      addMessage(sid, { id: uid(), role: 'assistant', content: '', isTyping: true, stepLabel: label })
+      clientRef.current?.sendMessage(text)
+    }
+  }, [isLoading, createSession, addMessage])
+
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
   }
@@ -522,6 +579,7 @@ export default function App() {
                   onUpload={msg.id === activeAskId ? handleUploadConfirm : undefined}
                   uploading={msg.id === activeAskId ? uploading : false}
                   uploadProgress={msg.id === activeAskId ? uploadProgress : 0}
+                  onQuickSend={handleQuickSend}
                 />
               ))}
               <div ref={bottomRef} />

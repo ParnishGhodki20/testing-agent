@@ -31,7 +31,7 @@ from app.config import (
     FAST_TC_NUM_PREDICT,
 )
 from app.prompts import (
-    SCENARIO_SYSTEM, TC_SYSTEM, TC_SINGLE_SYSTEM,
+    SCENARIO_SYSTEM, TC_SYSTEM, TC_TITLE_SYSTEM, TC_EXPAND_SYSTEM,
     GENERAL_SYSTEM, COVERAGE_REVISE_SYSTEM,
 )
 
@@ -114,7 +114,8 @@ def _format_docs(docs) -> str:
 _PROMPT_MAP: dict[str, str] = {
     "scenario":   SCENARIO_SYSTEM,
     "testcase":   TC_SYSTEM,
-    "tc_single":  TC_SINGLE_SYSTEM,
+    "tc_title":   TC_TITLE_SYSTEM,
+    "tc_expand":  TC_EXPAND_SYSTEM,
     "general":    GENERAL_SYSTEM,
     "coverage":   COVERAGE_REVISE_SYSTEM,
 }
@@ -159,7 +160,7 @@ def build_chain(mode: str, llm: ChatOllama, retriever):
 
 
 # ---------------------------------------------------------------------------
-# Rolling batched TC generation — primary generation path
+# Batched TC Title generation (Pass 1)
 # ---------------------------------------------------------------------------
 
 async def generate_tcs_rolling(
@@ -167,175 +168,128 @@ async def generate_tcs_rolling(
     llm: ChatOllama,
     retriever,
     summary: str,
-    batch_size: int = TC_BATCH_SIZE,
+    batch_size: int = 3,  # Small batches to preserve strict SC grouping
     timeout_secs: float = TC_TIMEOUT_SECS,
 ) -> tuple[str, str, list[str]]:
     """
-    Rolling batched TC generation with per-batch Python eval + sanitization.
-
-    Architecture:
-      1. Split scenario queue into batches of batch_size.
-      2. For each batch:
-           a. Generate TCs (single LLM call — the ONLY model call per batch).
-           b. Run eval_tc_batch() — Python-only, <10ms.
-           c. If eval finds missing SCs AND not FAST_MODE: one targeted retry.
-           d. Run sanitize_test_cases() — deterministic formatting repair.
-           e. Accumulate and advance TC counter.
-      3. Return (merged_text, merged_context, completed_ids).
+    Sequential batched TC Title generation.
+    Runs batches one at a time so TC numbering is always correct.
     """
-    from app.evals import eval_tc_batch
-    from app.sanitizer import sanitize_test_cases, renumber_test_cases
-
     batches = [
         scenarios[i : i + batch_size]
         for i in range(0, len(scenarios), batch_size)
     ]
     n_batches = len(batches)
 
-    # Concurrency control: Set to 1 for local Macs! 
-    # Parallel requests sit in Ollama's queue, burning their asyncio timeout before they even start!
-    concurrency_limit = 1
-    semaphore = asyncio.Semaphore(concurrency_limit)
-    
-    async def process_batch(batch_idx: int, batch: list[dict]) -> tuple[str, str, list[str]]:
-        async with semaphore:
-            batch_num = batch_idx + 1
-            batch_sc_ids = [s["id"] for s in batch]
-            # Predict starting TC number to avoid conflicts in parallel execution
-            predicted_start_tc = (batch_idx * 10) + 1
-            
-            logger.info(
-                "Rolling batch %d/%d — %s (Starting at TC%d) [Parallel Task]",
-                batch_num, n_batches, batch_sc_ids, predicted_start_tc,
+    all_outputs: list[str]   = []
+    all_contexts: list[str]  = []
+    completed_ids: list[str] = []
+    next_tc_num = 1  # Global TC counter maintained across batches
+
+    for batch_idx, batch in enumerate(batches):
+        batch_num    = batch_idx + 1
+        batch_sc_ids = [s["id"] for s in batch]
+
+        logger.info(
+            "Title batch %d/%d — %s (starting at TC%d)",
+            batch_num, n_batches, batch_sc_ids, next_tc_num,
+        )
+
+        sc_block = "\n\n".join(
+            f"{s['id']}: {s['title']}"
+            + (f"\nDescription: {s['description']}" if s.get("description") else "")
+            for s in batch
+        )
+
+        tc_chain = build_chain("tc_title", llm, retriever)
+        inputs = {
+            "input": (
+                f"List test case index entries. "
+                f"Output only Title, Type, and Goal per TC. "
+                f"Start TC numbering from TC{next_tc_num}."
+            ),
+            "chat_history":         [],
+            "conversation_summary": summary[-500:],
+            "scenarios":            sc_block,
+            "existing_output":      "",
+            "missing_items":        "",
+        }
+
+        batch_output = ""
+        batch_ctx    = ""
+
+        try:
+            response = await asyncio.wait_for(
+                tc_chain.ainvoke(inputs),
+                timeout=timeout_secs,
             )
+            batch_output = response.get("answer", "").strip()
+            batch_ctx    = response.get("context", "")
+        except Exception as exc:
+            logger.error("Batch %d/%d failed: %s", batch_num, n_batches, exc)
 
-            sc_block = "\n\n".join(
-                f"{s['id']}: {s['title']}"
-                + (f"\nDescription: {s['description']}" if s.get("description") else "")
-                for s in batch
-            )
+        if not batch_output:
+            batch_output = f"⚠️ Failed to generate index for {batch_sc_ids}."
+        else:
+            # Count actual TC lines in this output to advance the global counter
+            tc_hits = re.findall(r"(?:^|\n)TC\s*\d+\s*:", batch_output, re.IGNORECASE)
+            next_tc_num += max(len(tc_hits), 1)
 
-            tc_chain = build_chain("tc_single", llm, retriever)
-            inputs = {
-                "input": (
-                    f"Generate test cases for the {len(batch)} scenario(s) below. "
-                    f"Start TC numbering from TC{predicted_start_tc}. "
-                    f"Generate a mix of Positive, Negative, Edge, and Exception categories. "
-                    f"STRICT RULE: Maximum 5 test cases total per scenario. Every scenario must have at least 1 test case."
-                ),
-                "chat_history":         [],
-                "conversation_summary": summary[-500:],
-                "scenarios":            sc_block,
-                "existing_output":      "",
-                "missing_items":        "",
-            }
-
-            batch_output = ""
-            batch_ctx    = ""
-
-            try:
-                response = await asyncio.wait_for(
-                    tc_chain.ainvoke(inputs),
-                    timeout=timeout_secs,
-                )
-                batch_output = response.get("answer", "").strip()
-                batch_ctx    = response.get("context", "")
-                
-                logger.debug("DEBUG batch %d scenarios: %s", batch_num, sc_block)
-                logger.debug("DEBUG batch %d output: %s", batch_num, batch_output)
-
-            except asyncio.TimeoutError:
-                logger.warning("Batch %d/%d timed out after %ss.", batch_num, n_batches, timeout_secs)
-            except Exception as exc:
-                logger.error("Batch %d/%d failed: %s", batch_num, n_batches, exc)
-
-            if not batch_output:
-                logger.warning("Batch %d/%d produced no output. Retrying once with fallback...", batch_num, n_batches)
-                try:
-                    retry_inputs = inputs.copy()
-                    retry_inputs["input"] = (
-                        f"You MUST generate test cases for these scenarios: {batch_sc_ids}. "
-                        "Do NOT return an empty response. Output the full structured test cases now."
-                    )
-                    response = await asyncio.wait_for(
-                        tc_chain.ainvoke(retry_inputs),
-                        timeout=timeout_secs,
-                    )
-                    batch_output = response.get("answer", "").strip()
-                    batch_ctx    = response.get("context", "")
-                    logger.debug("DEBUG batch %d retry output: %s", batch_num, batch_output)
-                except Exception as exc:
-                    logger.error("Batch %d/%d retry failed: %s", batch_num, n_batches, exc)
-                    
-                if not batch_output:
-                    logger.error("Batch %d/%d still produced no output. Returning partial error.", batch_num, n_batches)
-                    batch_output = f"⚠️ [System Error] Failed to generate test cases for {batch_sc_ids} after retries."
-
-            for sc in batch:
-                if sc["id"].lower() not in batch_output.lower():
-                    batch_output = f"{sc['id']}: {sc['title']}\n\n" + batch_output
-
-            eval_result = eval_tc_batch(batch_output, batch_sc_ids)
-
-            if not eval_result.passed and eval_result.missing_sc_ids and not FAST_MODE:
-                missing_in_batch = [s for s in batch if s["id"] in set(eval_result.missing_sc_ids)]
-                if missing_in_batch:
-                    logger.info("Batch %d: retrying for missing %s", batch_num, eval_result.missing_sc_ids)
-                    retry_block = "\n\n".join(
-                        f"{s['id']}: {s['title']}"
-                        + (f"\nDescription: {s['description']}" if s.get("description") else "")
-                        for s in missing_in_batch
-                    )
-                    tc_nums = re.findall(r"\bTC(\d+)\b", batch_output, re.IGNORECASE)
-                    retry_start = max((int(n) for n in tc_nums), default=predicted_start_tc - 1) + 1
-
-                    retry_inputs = {
-                        "input": (
-                            f"Generate test cases for these {len(missing_in_batch)} missing scenario(s). "
-                            f"Start TC numbering from TC{retry_start}."
-                        ),
-                        "chat_history":         [],
-                        "conversation_summary": summary[-300:],
-                        "scenarios":            retry_block,
-                        "existing_output":      "",
-                        "missing_items":        "",
-                    }
-                    try:
-                        retry_resp = await asyncio.wait_for(
-                            tc_chain.ainvoke(retry_inputs),
-                            timeout=timeout_secs,
-                        )
-                        retry_text = retry_resp.get("answer", "").strip()
-                        if retry_text:
-                            batch_output = batch_output.rstrip() + "\n\n" + retry_text
-                            logger.info("Batch %d: retry added content for missing SCs.", batch_num)
-                    except Exception as exc:
-                        logger.warning("Batch %d retry for missing SCs failed: %s", batch_num, exc)
-
-            batch_output = sanitize_test_cases(batch_output)
-
-            return batch_output, batch_ctx, batch_sc_ids
-
-    # Execute all batches concurrently
-    logger.info("Starting parallel generation of %d batches with concurrency limit %d", n_batches, concurrency_limit)
-    tasks = [process_batch(i, b) for i, b in enumerate(batches)]
-    results = await asyncio.gather(*tasks)
-    
-    all_outputs = []
-    all_contexts = []
-    completed_ids = []
-    
-    for out_text, out_ctx, out_ids in results:
-        if out_text:
-            all_outputs.append(out_text)
-        if out_ctx:
-            all_contexts.append(out_ctx)
-        completed_ids.extend(out_ids)
+        all_outputs.append(batch_output)
+        if batch_ctx:
+            all_contexts.append(batch_ctx)
+        completed_ids.extend(batch_sc_ids)
 
     merged_text    = "\n\n".join(all_outputs)
-    merged_text    = renumber_test_cases(merged_text)
+    # NOTE: renumber_test_cases is intentionally NOT called here.
+    # It does not understand SC-grouping and would corrupt the grouped structure.
     merged_context = "\n".join(all_contexts[:2])
     return merged_text, merged_context, completed_ids
+
+
+# ---------------------------------------------------------------------------
+# Test Case Expansion
+# ---------------------------------------------------------------------------
+
+async def expand_test_case(
+    tc_title: str,
+    tc_type: str,
+    tc_goal: str,
+    scenario_context: str,
+    llm: ChatOllama,
+    retriever,
+    summary: str,
+) -> tuple[str, str]:
+    """
+    Expands a single test case outline into full steps.
+    """
+    expand_chain = build_chain("tc_expand", llm, retriever)
+    inputs = {
+        "input": "Generate the steps and expected outcomes for this test case.",
+        "chat_history": [],
+        "conversation_summary": summary[-500:],
+        "scenarios": scenario_context,
+        "existing_output": "",
+        "missing_items": "",
+    }
+    
+    # We inject the TC variables dynamically into the prompt
+    # ChatPromptTemplate handles this if we pass them in inputs, but we need to modify build_chain or just replace here.
+    # It's easier to inject them into the input text directly since our build_chain uses a generic ChatPromptTemplate.
+    # Wait, the prompt TC_EXPAND_SYSTEM uses {tc_title}, {tc_type}, {tc_goal}.
+    # We must pass these to the chain invoke.
+    inputs["tc_title"] = tc_title
+    inputs["tc_type"] = tc_type
+    inputs["tc_goal"] = tc_goal
+
+    try:
+        response = await expand_chain.ainvoke(inputs)
+        return response.get("answer", "").strip(), response.get("context", "")
+    except Exception as exc:
+        logger.error("Expansion failed for %s: %s", tc_title, exc)
+        return f"⚠️ Failed to generate steps: {exc}", ""
+
+
 
 
 # ---------------------------------------------------------------------------

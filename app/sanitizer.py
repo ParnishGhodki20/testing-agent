@@ -2,8 +2,8 @@
 Output sanitizer — post-processes LLM output before it reaches the user.
 
 Functions:
-  sanitize_scenarios()    clean scenario text (strip verifier noise)
-  sanitize_test_cases()   clean TC text (fix formatting, strip metadata, repair placeholders)
+  sanitize_scenarios()    clean scenario text
+  sanitize_test_cases()   clean TC outline text
 """
 import re
 
@@ -11,189 +11,83 @@ import re
 # Compiled patterns
 # ---------------------------------------------------------------------------
 
-# Verifier footer as appended by main.py:  "---\n*Verifier: REVISED*"
 _VERIFIER_FOOTER_RE = re.compile(
     r"\n+---\n\*?Verifier\s*:\s*\S+\*?\s*$",
     re.IGNORECASE,
 )
 
-# Any line that is just a verdict/verifier status marker
 _VERDICT_LINE_RE = re.compile(
     r"^\s*(VERDICT|Verifier)\s*:\s*(PASS|REVISE|REVISED|COVERAGE_INCOMPLETE)\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
-
-# TC header where the title is still a template placeholder
-# Matches: TC1: [Test Case Title]  /  TC2: [Title]  /  TC3: [Enter title here]
-_TC_PLACEHOLDER_TITLE_RE = re.compile(
-    r"^(TC\s*\d+\s*[:\.])\s*\[[\w\s]+\]\s*$",
-    re.MULTILINE | re.IGNORECASE,
-)
-
-# Inline mention of [Test Case Title] anywhere (e.g. inside a line)
-_INLINE_PLACEHOLDER_RE = re.compile(
-    r"\[Test\s+Case\s+Title\]|\[TC\s+Title\]|\[Title\]|\[Enter\s+title\]",
-    re.IGNORECASE,
-)
-
-# Detects Action: and Expected Result: merged on the same line.
-# Pattern: line contains "Action:" or a numbered step, AND "Expected Result:" later in same line.
-_MERGED_AR_RE = re.compile(
-    r"((?:\d+[\.\)]\s*)?(?:Action|Step)\s*:\s+.+?)\s{1,}(Expected\s+(?:Result|Outcome)\s*:)",
-    re.IGNORECASE,
-)
-
-# Standardise "Type:" labels — value must be one of the known categories
-_VALID_TYPE_VALUES = frozenset(["positive", "negative", "edge", "exception", "boundary"])
-_TYPE_LINE_RE = re.compile(
-    r"^(\s*Type\s*:\s*)(.+?)\s*$",
-    re.MULTILINE | re.IGNORECASE,
-)
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _fix_merged_action_er(text: str) -> str:
-    """
-    Split lines where Action/step and Expected Result/Outcome appear concatenated
-    on the same line. Preserves indentation.
-
-    Handles:
-      1. Action: Click submit  Expected Result: Modal closes
-      2. 1. Do something  Expected Outcome: Result appears
-      3. Action: Click button Expected Outcome: Page refreshes
-
-    After:
-      1. Action: Click submit
-         Expected Result: Modal closes
-
-      1. Do something
-         Expected Outcome: Result appears
-    """
-    # Match Expected Result: or Expected Outcome: mid-line
-    _er_mid_re = re.compile(
-        r"Expected\s+(?:Result|Outcome)\s*:", re.IGNORECASE
-    )
-    # Match Action: or numbered step at start
-    _act_start_re = re.compile(
-        r"(?:\d+[\.\)]\s*)?(?:Action|Step)\s*:", re.IGNORECASE
-    )
-    # Match plain numbered step: "1. Do something"
-    _num_start_re = re.compile(r"\d+[\.\)]\s+")
-
-    lines = text.splitlines()
-    result: list[str] = []
-
-    for line in lines:
-        er_m = _er_mid_re.search(line)
-        if not er_m:
-            result.append(line)
-            continue
-
-        # Check if there's an action/step or numbered step BEFORE the ER on the same line
-        prefix = line[:er_m.start()]
-        act_m = _act_start_re.search(prefix)
-        num_m = _num_start_re.match(prefix.lstrip())
-
-        # Only split if there's meaningful content before ER
-        if (act_m or num_m) and len(prefix.strip()) > 3:
-            indent = " " * (len(line) - len(line.lstrip()))
-            action_part = prefix.rstrip()
-            er_part     = line[er_m.start():]
-            result.append(action_part)
-            result.append(indent + er_part.lstrip())
-        else:
-            result.append(line)
-
-    return "\n".join(result)
-
-
-
-def _repair_placeholder_titles(text: str) -> str:
-    """
-    Replace placeholder TC titles with a generic sensible label.
-    TC3: [Test Case Title]  →  TC3: Test Scenario Verification
-    """
-    def _replacer(m: re.Match) -> str:
-        return m.group(1) + " Test Scenario Verification"
-
-    text = _TC_PLACEHOLDER_TITLE_RE.sub(_replacer, text)
-    text = _INLINE_PLACEHOLDER_RE.sub("Test Scenario Verification", text)
-    return text
-
-
-def _standardise_type_labels(text: str) -> str:
-    """
-    Normalise Type: label values to Title Case.
-    Removes any Type: line whose value isn't a recognised category.
-    """
-    def _norm(m: re.Match) -> str:
-        raw = m.group(2).strip().lower()
-        if raw in _VALID_TYPE_VALUES:
-            return m.group(1) + raw.title()
-        # Unknown value — keep it but normalise to title case
-        return m.group(1) + m.group(2).strip().title()
-
-    return _TYPE_LINE_RE.sub(_norm, text)
-
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def sanitize_scenarios(text: str) -> str:
-    """
-    Clean scenario output for user display.
-
-    - Strips verifier footers / verdict lines
-    - Collapses excessive blank lines
-    """
+    """Clean scenario output for user display."""
     text = _VERDICT_LINE_RE.sub("", text)
     text = _VERIFIER_FOOTER_RE.sub("", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
+# Matches LLM preamble lines like "Here is the list of..." / "Below is..." / "Sure! Here are..."
+_PREAMBLE_RE = re.compile(
+    r"^\s*(?:here\s+(?:is|are)|below\s+(?:is|are)|sure[!,]?|certainly[!,]?|of\s+course[!,]?)"
+    r"[^\n]*\n",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 def sanitize_test_cases(text: str) -> str:
     """
-    Clean TC output for user display.
-
-    Repairs:
-      1. Verifier verdict lines / footer
-      2. Placeholder TC titles ([Test Case Title])
-      3. Action / Expected Result merged on same line
-      4. Type: label normalisation
-      5. Excessive blank lines
+    Clean TC outline output for user display.
+    - Strips verifier noise
+    - Strips LLM preamble / intro lines
+    - Strips any hallucinated steps, actions, or preconditions
+    - Enforces [Generate Steps](#expand:TCn) on every TC that is missing it
+    - Collapses excess blank lines
     """
-    # 1. Strip verifier metadata
     text = _VERDICT_LINE_RE.sub("", text)
     text = _VERIFIER_FOOTER_RE.sub("", text)
 
-    # 2. Fix merged Action/Expected Result lines
-    text = _fix_merged_action_er(text)
+    # Strip LLM intro lines ("Here is the list...", "Sure, here are...")
+    text = _PREAMBLE_RE.sub("", text)
 
-    # 3. Repair placeholder titles
-    text = _repair_placeholder_titles(text)
+    # Backend enforcement: strip hallucinated steps / preconditions / actions
+    hallucination_start = r"(?i)(?:^|\n)\s*(?:Preconditions?|Actions?|Expected\s+(?:Outcome|Result)s?|(?:\d+\.\s*)?Steps?)[:\n]"
+    next_header = r"(?=(?:\n\s*TC\d+\s*:|\n\s*SC\d+\s*:|\Z))"
+    text = re.sub(hallucination_start + r".*?" + next_header, "", text, flags=re.DOTALL)
 
-    # 4. Standardise Type: labels
-    text = _standardise_type_labels(text)
+    # Enforce [Generate Steps](#expand:TCn) on every TC entry that is missing it.
+    # A TC block is: a line starting with TC<n>: ... followed by Type: and Goal: lines.
+    # After the Goal: line, if the expand link is absent, we inject it.
+    def _inject_expand(m: re.Match) -> str:
+        tc_num = m.group(1)
+        block  = m.group(0)
+        link   = f"[Generate Steps](#expand:TC{tc_num})"
+        if link not in block:
+            # Append after the Goal: line (last non-empty line in block before next header)
+            block = block.rstrip() + f"\n{link}"
+        return block
 
-    # 4.5. Remove empty lines and indentation before Expected Outcome and Action steps
-    text = re.sub(r"([^\n])\n+\s*(Expected Outcome:)", r"\1\n\2", text, flags=re.IGNORECASE)
-    text = re.sub(r"([^\n])\n+\s*(\d+\.\s*Action:)", r"\1\n\2", text, flags=re.IGNORECASE)
+    # Match a TC block: TC<n>: ... up to but not including the next TC/SC or end
+    text = re.sub(
+        r"TC(\d+)\s*:.*?(?=\n(?:TC|SC)\s*\d+\s*:|\Z)",
+        _inject_expand,
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
 
-    # 5. Collapse blank lines
+    # Collapse excess blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
-
     return text.strip()
 
 
 def renumber_test_cases(text: str) -> str:
     """
-    Deterministically renumbers all 'TCn:' headings from 1 to N sequentially,
-    removing any gaps caused by parallel batch generation or LLM skipped numbers.
+    Deterministically renumbers all 'TCn:' headings from 1 to N sequentially.
     """
     counter = 1
     
@@ -205,6 +99,4 @@ def renumber_test_cases(text: str) -> str:
         counter += 1
         return replacement
 
-    # Matches "**TC1:**" or "TC 2:" or "TC03:"
-    # Using re.IGNORECASE to catch "tc1:" or "Tc1:"
     return re.sub(r"(^|\n)(?:\*\*)?TC\s*\d+\s*:?(?:\*\*)?", replacer, text, flags=re.IGNORECASE)
