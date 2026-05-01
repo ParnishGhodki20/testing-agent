@@ -13,7 +13,7 @@ interface UploadedFile { file: File; id: string }
 const IconMenu = () => (<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>)
 const IconEdit = () => (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>)
 const IconSearch = () => (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>)
-const IconFolder = () => (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>)
+
 const IconCode = () => (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>)
 const IconMore = () => (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>)
 const IconChevronDown = () => (<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"/></svg>)
@@ -49,16 +49,12 @@ function Sidebar({ collapsed, sessions, activeId, status, onNewChat, onSelectSes
   return (
     <aside className={`sidebar${collapsed ? ' collapsed' : ''}`}>
       <div className="sidebar-header">
-        <span className="sidebar-logo">Testing Copilot</span>
+        <img src="/public/logo.png" alt="Icertis Logo" className="sidebar-logo-img" />
+        <span className="sidebar-logo">Icertis</span>
         <button className="sidebar-icon-btn" onClick={onNewChat} title="New chat"><IconEdit /></button>
       </div>
       <button className="new-chat-btn" onClick={onNewChat}><IconPlus /> New chat</button>
       <button className="sidebar-search"><IconSearch /> Search chats</button>
-      <nav className="sidebar-nav">
-        <button className="sidebar-nav-item"><IconFolder /> Projects</button>
-        <button className="sidebar-nav-item"><IconCode /> Codex</button>
-        <button className="sidebar-nav-item"><IconMore /> More</button>
-      </nav>
       {sessions.length > 0 && (<>
         <div className="sidebar-section-label">Recents</div>
         <div className="sidebar-history">
@@ -414,6 +410,16 @@ export default function App() {
         refs.push(ref)
       }
       setUploadProgress(100)
+      
+      const rawName = files[0].name
+      const cleanName = rawName.replace(/\.[^/.]+$/, "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())
+      
+      const sid = activeIdRef.current
+      if (activeSession?.messages.length === 0) {
+        updateTitle(sid, cleanName)
+        addMessage(sid, { id: uid(), role: 'user', content: `📄 ${cleanName}` })
+      }
+      
       if (pendingAskRef.current) {
         const respond = pendingAskRef.current; pendingAskRef.current = null
         respond(refs.map(r => ({ id: r.id })))

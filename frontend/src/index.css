@@ -101,8 +101,16 @@ body {
   color: var(--text-primary);
 }
 
+.sidebar-logo-img {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+  margin-right: 4px;
+  border-radius: 4px;
+}
+
 .sidebar-logo {
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 600;
   color: var(--text-primary);
   flex: 1;
@@ -199,9 +207,9 @@ body {
   justify-content: space-between;
   border-radius: 8px;
   background: transparent;
-  transition: background 0.15s;
-  padding-right: 4px;
-  margin-bottom: 2px;
+  transition: background 0.2s ease;
+  padding: 2px 4px;
+  margin-bottom: 4px;
 }
 
 .history-item-container:hover {
@@ -210,6 +218,7 @@ body {
 
 .history-item-container.active {
   background: var(--surface);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
 }
 
 .history-item {
@@ -217,18 +226,19 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 7px 12px;
+  padding: 8px 10px;
   border-radius: 8px;
   border: none;
   background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
-  font-size: 13px;
+  font-size: 14px;
+  font-weight: 500;
   text-align: left;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  transition: color 0.15s;
+  transition: color 0.2s ease;
   min-width: 0;
 }
 
